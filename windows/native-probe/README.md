@@ -1,8 +1,10 @@
 # 独立 Windows DXGI + Media Foundation H.264 探针
 
-状态：用户已确认云端Windows构建成功，Intel HD Graphics 630主屏1920×1080、Microsoft软件H264初始化及编码属性设置成功；尚未产生完整视频验收结果。revision=2修复了错误强制要求WHOLE_SAMPLES标志的问题，**此修订的Windows运行和WebCodecs播放待实机验证**。本程序没有接入 Agent，不连接 Relay，不采集音频、不执行鼠标操作，不修改现有 macOS 或生产浏览器。
+revision=4新增供Go Agent调用的 `--stream --encoder software` 连续管道模式，不生成文件，且不保存逐帧历史；Agent两文件部署见 [MF_AGENT.md](../MF_AGENT.md)。独立文件探针模式仍保留。Agent默认不使用尚未验证成功的硬件MFT，下一步只需验实时公网链路。
 
-revision=2启动时输出 `native-probe revision=2 (output flags compatibility)`。缺少WHOLE_SAMPLES不再使程序提前退出，仍严格校验实际Annex B、切片帧边界、SPS/PPS、IDR、PTS与输入输出数量，不支持的分片/多帧sample会明确报错，不把它们强行当作完整帧。
+状态：用户已确认云端Windows构建成功，Intel HD Graphics 630主屏1920×1080的软件路径输出200帧/10个IDR，软件视频网页验证通过。Intel硬件MFT初始化通过，revision=2首次输出遇到E_UNEXPECTED。revision=3修复异步事件后的重复输出调用，**此修订的Windows硬编运行和网页播放待实机验证**。本程序没有接入 Agent，不连接 Relay，不采集音频、不执行鼠标操作，不修改现有 macOS 或生产浏览器。
+
+revision=3启动时输出 `native-probe revision=3 (one ProcessOutput per HaveOutput event)`。继承revision=2的WHOLE_SAMPLES兼容修复，仍严格校验实际Annex B、切片帧边界、SPS/PPS、IDR、PTS与输入输出数量。一次HaveOutput只调用一次ProcessOutput，类型变更或仅事件输出后等待下一事件，避免额外读取导致E_UNEXPECTED。新增前3次输出和失败调用的HRESULT、状态、事件计数与pending诊断；这能定位后续错误，不证明硬编已通过。[微软异步MFT契约](https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts)
 
 ## 先构建，再复制一个 EXE
 

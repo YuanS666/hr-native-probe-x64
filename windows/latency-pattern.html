@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>端到端光学延迟测试源</title>
+<style>body{margin:0;display:grid;place-content:center;height:100vh;font:80px monospace;text-align:center}small{font:20px system-ui}</style>
+<div id="counter">0</div><small>在 Windows 主屏显示本页；同时拍摄源屏幕和控制端屏幕，匹配相同编号。</small>
+<script>
+let sequence=0;
+// advance 每 100 毫秒显示唯一递增编号和颜色，供同一相机在源屏与远端屏中匹配，不依赖两端时钟同步。
+function advance(){sequence++;document.querySelector('#counter').textContent=sequence;document.body.style.backgroundColor=`hsl(${sequence*137.5%360} 70% 70%)`;}
+setInterval(advance,100);
+</script></html>

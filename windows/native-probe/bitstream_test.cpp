@@ -14,6 +14,11 @@ int main(int argc,char** argv) {
         auto delta=h.normalize({0,0,0,1,9,0xf0,0,0,1,0x41,0xe0});
         require(!delta.key && splitAnnexB(delta.data).size()==2,"delta normalization");
         require(base64({})=="" && base64({1})=="AQ==" && base64({1,2})=="AQI=" && base64({1,2,3})=="AQID","base64");
+        auto packet=videoPacket(AccessUnit{{0,0,0,1,9,0xf0},true},500000);
+        require(packet.size()==23&&packet[0]==1&&packet[7]==0xc3&&packet[8]==0x50,"17-byte protocol / 100ns to microseconds");
+        for(unsigned i=9;i<17;++i) require(packet[i]==0,"ready must be filled by Go");
+        auto record=streamRecord(packet);
+        require(record.size()==27&&record[0]==0&&record[1]==0&&record[2]==0&&record[3]==23,"length-prefixed native IPC");
         for (const Bytes& bad : std::vector<Bytes>{{1,2,3},{0,0,1},{0,0,1,0x81},{0,0,1,0x41,0xa0},{0,0,1,0x41,0xe0,0,0,1,0x41,0xe0}}) {
             bool rejected=false;
             try { h.normalize(bad); } catch(const std::runtime_error&) {rejected=true;}

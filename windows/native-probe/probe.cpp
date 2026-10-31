@@ -12,6 +12,8 @@
 #include <psapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <io.h>
+#include <fcntl.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -73,6 +75,7 @@ struct Options {
     UINT width=1920,height=1080,fps=20,bitrate=2000000,seconds=10;
     std::wstring encoder=L"auto";
     fs::path output=L"capture";
+    bool stream=false;
 };
 
 // options 读取有限的探针参数，防止误生成无限时长或极大尺寸文件。
@@ -80,8 +83,9 @@ static Options options(int argc,wchar_t** argv) {
     Options o;
     for(int i=1;i<argc;++i) {
         std::wstring key=argv[i];
+        if(key==L"--stream") {o.stream=true;continue;}
         if(key==L"--help") {
-            std::cout<<"screen_native_probe [--encoder auto|hardware|software] [--seconds 10] [--output capture] [--width 1920] [--height 1080] [--fps 20] [--bitrate 2000000]\n";
+            std::cout<<"screen_native_probe [--encoder auto|hardware|software] [--seconds 10] [--output capture] [--width 1920] [--height 1080] [--fps 20] [--bitrate 2000000] [--stream (software only)]\n";
             std::exit(0);
         }
         require(i+1<argc,"missing option value");
@@ -102,6 +106,7 @@ static Options options(int argc,wchar_t** argv) {
     require(o.width>=2&&o.width<=3840&&o.width%2==0&&o.height>=2&&o.height<=2160&&o.height%2==0,"output size must be even, <=3840x2160");
     require(o.fps>=1&&o.fps<=60&&o.seconds>=2&&o.seconds<=120&&o.bitrate>=10000&&o.bitrate<=20000000,"fps=1..60, seconds=2..120, bitrate=10000..20000000");
     require(o.encoder==L"auto"||o.encoder==L"hardware"||o.encoder==L"software","invalid encoder mode");
+    require(!o.stream||o.encoder==L"software","--stream requires explicit --encoder software; hardware integration is not verified");
     return o;
 }
 
@@ -329,9 +334,16 @@ struct Files {
     LONGLONG lastPTS=-1;
     double maxEncode=0,sumEncode=0;
     std::vector<double> encodeTimes;
+    bool streaming=false;
 
-    // Files 拒绝覆盖已有输出，创建原始流、离线网页和真实测量 CSV。
+    // Files 在探针模式创建结果文件；Agent模式只切换二进制管道，不生成任何文件。
     explicit Files(const Options& o) {
+        streaming=o.stream;
+        if(streaming) {
+            require(_setmode(_fileno(stdout),_O_BINARY)!=-1,"cannot switch stdout to binary mode");
+            std::cerr<<"MF streaming: length-prefixed H264 packets on stdout; no files, no hardware encoding, no FFmpeg.\n";
+            return;
+        }
         fs::path paths[4]={o.output.wstring()+L".h264",o.output.wstring()+L".html",o.output.wstring()+L"-timing.csv",o.output.wstring()+L"-stats.csv"};
         for(const auto& p:paths) require(!fs::exists(p),"output exists; use another --output prefix");
         raw.open(paths[0],std::ios::binary);page.open(paths[1],std::ios::binary);
@@ -350,19 +362,23 @@ struct Files {
         if(au.data.empty()) return false;
         require(pts>=0&&pts>lastPTS,"non-increasing or missing output PTS");
         require(frames!=0||au.key,"first encoded frame is not IDR");
-        require(bytes+au.data.size()<=64u*1024u*1024u,"probe output exceeded 64 MiB limit");
-        raw.write(reinterpret_cast<const char*>(au.data.data()),static_cast<std::streamsize>(au.data.size()));
-        Bytes packet(17,0);packet[0]=au.key?1:0;
-        UINT64 us=UINT64(pts/10);
-        for(unsigned i=0;i<8;++i) packet[1+i]=std::uint8_t(us>>(56-8*i));
-        packet.insert(packet.end(),au.data.begin(),au.data.end());
-        if(frames) page<<",\n";
-        page<<'"'<<probe::base64(packet)<<'"';
-        timing<<frames<<','<<pts<<','<<au.key<<','<<au.data.size()<<','<<latencyMS<<'\n';
-        require(raw.good()&&page.good()&&timing.good(),"output write failed");
+        auto packet=probe::videoPacket(au,UINT64(pts));
+        if(streaming) {
+            auto record=probe::streamRecord(packet);
+            // 同步管道反压使慢浏览器不能积压无限视频；Go断连时会终止此进程。
+            require(std::fwrite(record.data(),1,record.size(),stdout)==record.size()&&std::fflush(stdout)==0,"native stream pipe closed or write failed");
+        } else {
+            require(bytes+au.data.size()<=64u*1024u*1024u,"probe output exceeded 64 MiB limit");
+            raw.write(reinterpret_cast<const char*>(au.data.data()),static_cast<std::streamsize>(au.data.size()));
+            if(frames) page<<",\n";
+            page<<'"'<<probe::base64(packet)<<'"';
+            timing<<frames<<','<<pts<<','<<au.key<<','<<au.data.size()<<','<<latencyMS<<'\n';
+            require(raw.good()&&page.good()&&timing.good(),"output write failed");
+        }
         ++frames;keys+=au.key;bytes+=au.data.size();lastPTS=pts;
         maxEncode=std::max(maxEncode,latencyMS);sumEncode+=latencyMS;
-        encodeTimes.push_back(latencyMS);
+        // 实时运行不保存逐帧历史，避免长时间运行时统计数组持续增长。
+        if(!streaming) encodeTimes.push_back(latencyMS);
         return true;
     }
 
@@ -387,6 +403,7 @@ struct Encoder {
     ComPtr<IMFDXGIDeviceManager> manager;
     bool hardware=false,drained=false;
     unsigned inputTokens=0;
+    UINT64 outputCalls=0,outputEvents=0;
     DWORD inputID=0,outputID=0;
     std::map<LONGLONG,double> pending;
     Files& files;
@@ -410,7 +427,8 @@ struct Encoder {
 
     // configure 协商输入输出、D3D管理器和流ID，软编和硬编共享H264输出契约。
     void configure(Capture& capture,bool hw) {
-        hardware=hw;inputTokens=0;events.Reset();codec.Reset();manager.Reset();pending.clear();
+        hardware=hw;inputTokens=0;outputCalls=outputEvents=0;
+        events.Reset();codec.Reset();manager.Reset();pending.clear();
         ComPtr<IMFAttributes> attrs;
         checked(transform->GetAttributes(&attrs),"MFT attributes");
         UINT32 async=0;attrs->GetUINT32(MF_TRANSFORM_ASYNC,&async);
@@ -527,11 +545,19 @@ struct Encoder {
             checked(supplied->AddBuffer(buffer.Get()),"output AddBuffer");data.pSample=supplied.Get();
         }
         DWORD status=0;HRESULT hr=transform->ProcessOutput(0,1,&data,&status);
+        ++outputCalls;
+        if(hardware&&(outputCalls<=3||FAILED(hr))) {
+            std::cerr<<"MFT ProcessOutput #"<<outputCalls<<" HaveOutput events="<<outputEvents
+                     <<" HRESULT=0x"<<std::hex<<static_cast<unsigned long>(hr)
+                     <<" stream_status=0x"<<data.dwStatus<<" process_status=0x"<<status<<std::dec
+                     <<" sample="<<(data.pSample?"yes":"no")<<" pending="<<pending.size()<<'\n';
+        }
         if(data.pEvents) data.pEvents->Release();
         ComPtr<IMFSample> sample;
         if(data.pSample) {if(data.pSample==supplied.Get()) sample=supplied;else sample.Attach(data.pSample);}
         if(hr==MF_E_TRANSFORM_STREAM_CHANGE) {
             // 只接受原尺寸/格式的重新协商，不静默改动浏览器配置。
+            std::cerr<<"MFT output type change; renegotiating, then waiting for the next HaveOutput event.\n";
             ComPtr<IMFMediaType> type;
             checked(transform->GetOutputAvailableType(outputID,0,&type),"changed output type");
             UINT32 w=0,h=0;GUID subtype{};
@@ -573,8 +599,9 @@ struct Encoder {
             MediaEventType type;checked(event->GetType(&type),"MFT event type");
             if(type==METransformNeedInput) {require(++inputTokens<=32,"MFT input tokens overflow");}
             else if(type==METransformHaveOutput) {
-                HRESULT out=output();
-                if(out==S_FALSE) output();
+                ++outputEvents;
+                // 一次HaveOutput只读一次；类型变更或仅事件输出后也必须等待下一事件，不能同步重读。
+                output();
             } else if(type==METransformDrainComplete) drained=true;
             else if(type==MEError) throw std::runtime_error("MFT MEError");
         }
@@ -657,19 +684,21 @@ struct Meter {
                 }
             }
         }
-        files.metrics<<(time-began)/1000<<','<<capture.fresh<<','<<capture.repeated<<','<<submitted<<','<<files.frames<<','<<fps<<','<<mbps<<','<<cpuPercent<<','<<memory.WorkingSetSize<<','<<memory.PrivateUsage;
-        for(double value:values) {files.metrics<<',';if(value>=0) files.metrics<<value;}
-        files.metrics<<'\n';
+        if(!files.streaming) {
+            files.metrics<<(time-began)/1000<<','<<capture.fresh<<','<<capture.repeated<<','<<submitted<<','<<files.frames<<','<<fps<<','<<mbps<<','<<cpuPercent<<','<<memory.WorkingSetSize<<','<<memory.PrivateUsage;
+            for(double value:values) {files.metrics<<',';if(value>=0) files.metrics<<value;}
+            files.metrics<<'\n';
+        }
         std::cerr<<std::fixed<<std::setprecision(2)<<"output="<<fps<<" FPS "<<mbps<<" Mbps CPU="<<cpuPercent<<"% of machine pending="<<submitted-files.frames<<" working="<<memory.WorkingSetSize/1048576.0<<" MiB\n";
         previousMS=time;previousCPU=cpu;previousFrames=files.frames;previousBytes=files.bytes;
     }
 };
 
-// wmain 执行有界真实桌面采集与MF编码，完整成功才生成可验收HTML，异常保留原始文件与原因。
+// wmain 在探针模式执行有界采集，在Agent模式按管道反压持续编码；异常退出且不自行重启。
 int wmain(int argc,wchar_t** argv) {
     try {
         Options opt=options(argc,argv);
-        std::cerr<<"native-probe revision=2 (output flags compatibility)\n";
+        std::cerr<<"native-capture revision=4 (MF software Agent streaming)\n";
         Runtime runtime;
         Capture capture(opt);
         Files files(opt);
@@ -678,7 +707,7 @@ int wmain(int argc,wchar_t** argv) {
         UINT64 submitted=0;
         LONGLONG duration=10000000/opt.fps,nextKey=0,lastPTS=-duration;
         double began=nowMS(),nextTick=began,lastStats=began,lastProgress=began;
-        while(submitted<UINT64(opt.seconds)*opt.fps&&nowMS()-began<double(opt.seconds)*1000) {
+        while(opt.stream||(submitted<UINT64(opt.seconds)*opt.fps&&nowMS()-began<double(opt.seconds)*1000)) {
             encoder.pump();
             double time=nowMS();
             if(time-lastStats>=1000) {meter.write(files,capture,submitted,began);lastStats=time;}

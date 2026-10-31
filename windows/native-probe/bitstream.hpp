@@ -87,6 +87,28 @@ inline void appendNAL(Bytes& out, const Bytes& nal) {
 }
 
 struct AccessUnit { Bytes data; bool key = false; };
+
+// videoPacket 将完整访问单元封装为既有17字节视频头，PTS从100ns转换为微秒，ready留给Go填入。
+inline Bytes videoPacket(const AccessUnit& au, std::uint64_t pts100ns) {
+    require(!au.data.empty()&&au.data.size()<=16u*1024u*1024u,"native AU size invalid");
+    Bytes packet(17,0);
+    packet[0]=au.key?1:0;
+    auto us=pts100ns/10;
+    for(unsigned i=0;i<8;++i) packet[1+i]=std::uint8_t(us>>(56-8*i));
+    packet.insert(packet.end(),au.data.begin(),au.data.end());
+    return packet;
+}
+
+// streamRecord 为一个完整视频包添加大端长度，允许管道任意拆分而不破坏帧边界。
+inline Bytes streamRecord(const Bytes& packet) {
+    require(packet.size()>17&&packet.size()<=(16u<<20)+17,"native packet size invalid");
+    auto n=static_cast<std::uint32_t>(packet.size());
+    Bytes record;
+    for(unsigned i=0;i<4;++i) record.push_back(std::uint8_t(n>>(24-8*i)));
+    record.insert(record.end(),packet.begin(),packet.end());
+    return record;
+}
+
 struct H264 {
     Bytes sps, pps;
     // parameters 缓存系统输出媒体类型中的 Annex B SPS/PPS，用于恢复关键帧。
