@@ -1,6 +1,8 @@
 # 独立 Windows DXGI + Media Foundation H.264 探针
 
-状态：源码已实现；macOS 上的可移植码流测试通过，**Windows 原生构建、采集和 WebCodecs 播放待实机验证**。本程序没有接入 Agent，不连接 Relay，不采集音频、不执行鼠标操作，不修改现有 macOS 或生产浏览器。
+状态：用户已确认云端Windows构建成功，Intel HD Graphics 630主屏1920×1080、Microsoft软件H264初始化及编码属性设置成功；尚未产生完整视频验收结果。revision=2修复了错误强制要求WHOLE_SAMPLES标志的问题，**此修订的Windows运行和WebCodecs播放待实机验证**。本程序没有接入 Agent，不连接 Relay，不采集音频、不执行鼠标操作，不修改现有 macOS 或生产浏览器。
+
+revision=2启动时输出 `native-probe revision=2 (output flags compatibility)`。缺少WHOLE_SAMPLES不再使程序提前退出，仍严格校验实际Annex B、切片帧边界、SPS/PPS、IDR、PTS与输入输出数量，不支持的分片/多帧sample会明确报错，不把它们强行当作完整帧。
 
 ## 先构建，再复制一个 EXE
 

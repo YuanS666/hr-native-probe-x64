@@ -437,6 +437,13 @@ struct Encoder {
         auto out=mediaType(opt,true),in=mediaType(opt,false);
         checked(transform->SetOutputType(outputID,out.Get(),0),"SetOutputType H264 baseline");
         checked(transform->SetInputType(inputID,in.Get(),0),"SetInputType NV12");
+        MFT_OUTPUT_STREAM_INFO info{};
+        checked(transform->GetOutputStreamInfo(outputID,&info),"negotiated output stream info");
+        std::cerr<<"MFT output flags=0x"<<std::hex<<info.dwFlags<<std::dec
+                 <<" minimum_buffer="<<info.cbSize<<" alignment="<<info.cbAlignment<<'\n';
+        // WHOLE_SAMPLES未声明不能直接判定H264失败，实际AU仍经NAL、切片头、PTS和浏览器校验。
+        if(!(info.dwFlags&MFT_OUTPUT_STREAM_WHOLE_SAMPLES))
+            std::cerr<<"WHOLE_SAMPLES not advertised; validating actual H264 access units and PTS.\n";
     }
 
     // choose 只在初始化阶段按同adapter枚举硬编；auto可回退系统软件编码，开始输出后不混用编码器。
@@ -505,7 +512,6 @@ struct Encoder {
     // output 读取一个实际编码sample，处理MFT分配/调用者分配与类型变更，拒绝无匹配PTS的帧。
     HRESULT output() {
         MFT_OUTPUT_STREAM_INFO info{};checked(transform->GetOutputStreamInfo(outputID,&info),"output stream info");
-        require((info.dwFlags&MFT_OUTPUT_STREAM_WHOLE_SAMPLES)!=0,"MFT does not guarantee whole output samples");
         MFT_OUTPUT_DATA_BUFFER data{};data.dwStreamID=outputID;
         ComPtr<IMFSample> supplied;
         if(!(info.dwFlags&MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
@@ -663,6 +669,7 @@ struct Meter {
 int wmain(int argc,wchar_t** argv) {
     try {
         Options opt=options(argc,argv);
+        std::cerr<<"native-probe revision=2 (output flags compatibility)\n";
         Runtime runtime;
         Capture capture(opt);
         Files files(opt);
