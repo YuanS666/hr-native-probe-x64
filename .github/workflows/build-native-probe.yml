@@ -1,16 +1,15 @@
-name: Build Windows Native Probe
+name: Build Windows Agent
 
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/build-native-probe.yml'
-      - 'windows/native-probe/**'
+      - 'windows/**'
       - 'index.html'
       - 'mouse_test.cjs'
       - '*.go'
       - 'go.mod'
-      - 'windows/MF_AGENT.md'
 
 permissions:
   contents: read
@@ -18,81 +17,29 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Configure x64 Release
-        run: cmake -S windows/native-probe -B build -G "Visual Studio 17 2022" -A x64
-      - name: Build native executable
-        run: cmake --build build --config Release --parallel 2
-      - name: Run bitstream tests (no desktop capture in CI)
-        run: ctest --test-dir build -C Release --output-on-failure
       - uses: actions/setup-go@v7
         with:
           go-version: '1.25.x'
           cache: false
-      - name: Test Agent native protocol and child-process cleanup
-        env:
-          CGO_ENABLED: '0'
-        run: go test -count=1 -run '^TestNative' .
-      - name: Build Windows Agent
-        env:
-          CGO_ENABLED: '0'
-          GOARCH: amd64
-        run: |
-          New-Item -ItemType Directory -Force -Path agent-artifact | Out-Null
-          go build -o agent-artifact/screen-agent-windows-amd64.exe .
-      - name: Test browser mouse focus handling
+      - name: Test browser pause/resume and mouse handling
         run: node mouse_test.cjs
-      - name: Build Linux Relay with updated browser page
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          New-Item -ItemType Directory -Force -Path relay-artifact | Out-Null
-          go build -o relay-artifact/screen-relay .
-          if ($LASTEXITCODE -ne 0) { throw 'Linux Relay build failed' }
-          Copy-Item windows/MF_AGENT.md relay-artifact/README.md
-      - name: Prepare executable and dependency report
+      - name: One-command native and Agent build
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path artifact | Out-Null
-          Copy-Item build/Release/screen_native_probe.exe artifact/
-          Copy-Item windows/native-probe/README.md artifact/
-          Copy-Item build/Release/screen_native_probe.exe agent-artifact/screen_capture.exe
-          Copy-Item windows/MF_AGENT.md agent-artifact/README.md
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'Visual Studio C++ toolchain not found' }
-          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
-          if (!$dumpbin) { throw 'dumpbin not found' }
-          & $dumpbin.FullName /dependents artifact/screen_native_probe.exe | Tee-Object artifact/dependencies.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Dependency inspection failed' }
-          Get-FileHash artifact/screen_native_probe.exe -Algorithm SHA256 | Format-List | Out-File artifact/SHA256.txt
-          "Commit: $env:GITHUB_SHA`nWindows compilation and bitstream tests passed. Desktop capture, MF encoding and browser playback are NOT verified by CI." | Out-File artifact/BUILD-STATUS.txt
-          Copy-Item artifact/dependencies.txt agent-artifact/capture-dependencies.txt
-          & $dumpbin.FullName /dependents agent-artifact/screen-agent-windows-amd64.exe | Out-File agent-artifact/agent-dependencies.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Agent dependency inspection failed' }
-          Get-FileHash agent-artifact/*.exe -Algorithm SHA256 | Format-List | Out-File agent-artifact/SHA256.txt
-          "Commit: $env:GITHUB_SHA`nAgent and helper compiled; native protocol/cleanup tests passed. Real Windows Agent video, mouse and public-network streaming are NOT verified by CI. MF software only; no FFmpeg required." | Out-File agent-artifact/BUILD-STATUS.txt
-      - uses: actions/upload-artifact@v7
-        with:
-          name: windows-native-probe-x64
-          path: artifact/
-          if-no-files-found: error
-          retention-days: 7
+        run: ./windows/build.ps1
       - uses: actions/upload-artifact@v7
         with:
           name: windows-agent-mf-x64
-          path: agent-artifact/
+          path: release/windows-agent-mf-x64/
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v7
         with:
           name: linux-relay-amd64
-          path: relay-artifact/
+          path: release/linux-relay-amd64/
           if-no-files-found: error
           retention-days: 7
