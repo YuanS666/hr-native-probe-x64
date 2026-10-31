@@ -407,10 +407,12 @@ func TestRelayVideoAndControl(t *testing.T) {
 
 // TestAgentDisconnectReleases 在已有按下状态下切断 Relay 字节流，验证 Agent 在返回前释放按键。
 func TestAgentDisconnectReleases(t *testing.T) {
-	oldID := *deviceID
+	oldID, oldEncoder := *deviceID, *encoder
 	*deviceID = "mac-test"
+	// 此用例模拟无首帧的旧FFmpeg生命周期；MF首帧门控由TestNativeAgent系列独立验证。
+	*encoder = "libx264"
 	// 恢复仅供本测试使用的设备配置。
-	defer func() { *deviceID = oldID }()
+	defer func() { *deviceID = oldID; *encoder = oldEncoder }()
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
@@ -455,10 +457,12 @@ func TestAgentDisconnectReleases(t *testing.T) {
 
 // TestAgentEncoderFailure 验证编码器异常后释放按键并退出连接，不在同一会话里无限重启编码。
 func TestAgentEncoderFailure(t *testing.T) {
-	oldID := *deviceID
+	oldID, oldEncoder := *deviceID, *encoder
 	*deviceID = "mac-test"
+	// 此用例模拟无首帧的旧FFmpeg生命周期；MF首帧门控由TestNativeAgent系列独立验证。
+	*encoder = "libx264"
 	// 测试结束恢复设备配置，避免影响其他认证用例。
-	defer func() { *deviceID = oldID }()
+	defer func() { *deviceID = oldID; *encoder = oldEncoder }()
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
