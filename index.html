@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>H.264 屏幕验证</title>
+<style>body{font:16px system-ui;margin:24px;background:#15171b;color:#eee}button{padding:8px 18px}canvas{display:block;max-width:100%;margin-top:16px;background:#000;object-fit:contain}pre{white-space:pre-wrap}</style>
+<h1>H.264 + WebSocket</h1>
+<button id="start">开始</button> <button id="stop">停止</button>
+<label><input id="mouse" type="checkbox" disabled>鼠标控制（Esc 停用）</label>
+<p id="mouse-status">连接后检查鼠标控制状态</p>
+<pre id="stats">未连接</pre>
+<p>本地延迟为 Go 收到完整编码帧 → canvas 提交的估计值，不含采集、编码及屏幕实际显示。跨机模式未同步时钟，无法可靠测量单向视频延迟。解码耗时含浏览器排队。</p>
+<canvas id="screen"></canvas>
+<script>
+const canvas=document.querySelector('#screen'), ctx=canvas.getContext('2d');
+const stats=document.querySelector('#stats');
+const mouseToggle=document.querySelector('#mouse'),mouseStatus=document.querySelector('#mouse-status');
+let mouseReady=false,lastMove=0,held=new Set();
+let relayDevice='',relaySession='';
+let ws,decoder,config,waiting=true, timer,lastError='无';
+let received=0,rendered=0,bytes=0,errors=0,dropped=0,decodeMS=[],latencyMS=[],pending=new Map();
+
+// showError 将错误显示并写入控制台；参数是编码器、网络或解码器给出的具体异常。
+function showError(error) {
+  errors++; lastError=String(error); stats.textContent='异常：'+lastError; console.error(error);
+}
+
+// resetDecoder 关闭旧解码器并清空帧记录，让后续 IDR 使用带内 SPS/PPS 重新初始化。
+function resetDecoder() {
+  if(decoder && decoder.state!=='closed') decoder.close();
+  decoder=null; pending.clear(); waiting=true;
+}
+
+// draw 在解码完成时绘制并释放 VideoFrame，按其媒体时间戳查找发送时间和解码开始时间。
+function draw(frame) {
+  try {
+    const timing=pending.get(frame.timestamp);
+    pending.delete(frame.timestamp);
+    if(canvas.width!==frame.displayWidth || canvas.height!==frame.displayHeight) {
+      canvas.width=frame.displayWidth; canvas.height=frame.displayHeight;
+    }
+    ctx.drawImage(frame,0,0); rendered++;
+    if(timing) {
+      decodeMS.push(performance.now()-timing.decode);
+      if(!relaySession) latencyMS.push(performance.timeOrigin+performance.now()-timing.ready/1000);
+    }
+  } catch(error) { showError(error); }
+  finally { frame.close(); }
+}
+
+// decoderError 报告异步解码异常并等待下一关键帧恢复，不把预测帧交给新解码器。
+function decoderError(error) { showError(error); resetDecoder(); }
+
+// message 将服务端配置或完整 Annex B 访问单元送入解码器；二进制头携带关键帧和两个微秒时间戳。
+function message(event) {
+  // 重新连接后忽略旧 WebSocket 已排队的消息，避免旧会话覆盖当前控制目标。
+  if(event.target!==ws) return;
+  try {
+    if(typeof event.data==='string') {
+      const value=JSON.parse(event.data);
+      if(value.type==='relay-session') {
+        resetDecoder();config=null;relayDevice=value.device;relaySession=value.session;return;
+      }
+      if(value.type==='mouse-status') {
+        mouseReady=value.enabled===true;mouseToggle.disabled=!mouseReady;
+        mouseStatus.textContent=value.message;return;
+      }
+      if(value.error) { showError(value.error); return; }
+      if(config && config.codec!==value.codec) resetDecoder();
+      config=value; return;
+    }
+    const view=new DataView(event.data);
+    if(view.byteLength<=17) throw Error('视频包过短');
+    const key=view.getUint8(0)===1, pts=Number(view.getBigUint64(1)), ready=Number(view.getBigUint64(9));
+    received++;bytes+=view.byteLength-17;
+    // 丢弃队列后必须等待 IDR，避免破坏参考帧链；这是最小的积压恢复机制。
+    if(decoder && (decoder.decodeQueueSize>4 || pending.size>8)) { dropped+=pending.size; resetDecoder(); }
+    if(waiting) {
+      if(!key || !config) { dropped++; return; }
+      decoder=new VideoDecoder({output:draw,error:decoderError});
+      // 不传 description，明确使用 Annex B，而非需要长度前缀的 AVCC。
+      decoder.configure({codec:config.codec,optimizeForLatency:true});
+      waiting=false;
+    }
+    pending.set(pts,{ready,decode:performance.now()});
+    decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:pts,data:new Uint8Array(event.data,17)}));
+  } catch(error) { showError(error); resetDecoder(); }
+}
+
+// summary 返回当前一秒样本的平均与最大毫秒值，无样本时明确显示暂无数据。
+function summary(values) {
+  if(!values.length) return '暂无';
+  let sum=0,max=-Infinity;
+  for(const value of values) {sum+=value;max=Math.max(max,value);}
+  return (sum/values.length).toFixed(1)+' / '+max.toFixed(1)+' ms（均值 / 最大）';
+}
+
+// stop 关闭会话、定时器与解码器，服务端随连接关闭停止 FFmpeg 采集。
+function stop() {
+  releaseMouse();mouseReady=false;mouseToggle.disabled=true;
+  relayDevice='';relaySession='';
+  mouseStatus.textContent='已停止鼠标控制';
+  if(ws) { ws.onclose=null;ws.close();ws=null; }
+  clearInterval(timer);resetDecoder();stats.textContent+='\n已停止';
+}
+
+// start 检查 WebCodecs 可用性后建立本地连接，并每秒显示实际吞吐量与耗时样本。
+function start() {
+  stop();config=null;lastError='无';errors=0;dropped=0;received=0;rendered=0;bytes=0;decodeMS=[];latencyMS=[];
+  if(!window.VideoDecoder) {showError('此浏览器或上下文不支持 VideoDecoder；请用本机 Chrome 打开 127.0.0.1');return;}
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');ws.binaryType='arraybuffer';
+  ws.onmessage=message;
+  // 网络错误缺少具体原因时，引导用户查看服务端日志。
+  ws.onerror=function() {showError('WebSocket 连接失败：检查 Agent 在线状态及服务日志；Relay 登录过期时刷新页面重新认证');};
+  // 服务端异常关闭后停止统计，保留最后的异常和数据。
+  ws.onclose=function() {releaseMouse();relayDevice='';relaySession='';mouseReady=false;mouseToggle.disabled=true;mouseStatus.textContent='连接已关闭，鼠标控制已停用';clearInterval(timer);resetDecoder();stats.textContent+='\n连接已关闭';};
+  let last=performance.now();
+  // 每秒按真实经过时间计算 FPS 和 H.264 负载码率，排除协议开销。
+  timer=setInterval(function() {
+    const now=performance.now(),seconds=(now-last)/1000;last=now;
+    if(mouseReady || relaySession) sendMouse({action:'heartbeat'});
+    const latency=relaySession?'不可可靠测量（两端时钟未同步）':summary(latencyMS);
+    stats.textContent=`接收 ${(received/seconds).toFixed(1)} FPS | 绘制 ${(rendered/seconds).toFixed(1)} FPS | H.264 ${(bytes*8/seconds/1e6).toFixed(3)} Mbps\n解码/排队 ${summary(decodeMS)}\n编码帧就绪 → canvas ${latency}\n错误 ${errors} | 丢弃 ${dropped} | 解码队列 ${decoder?.decodeQueueSize??0}`;
+    stats.textContent+='\n最近异常：'+lastError;
+    received=0;rendered=0;bytes=0;decodeMS=[];latencyMS=[];
+  },1000);
+}
+document.querySelector('#start').onclick=start;
+document.querySelector('#stop').onclick=stop;
+
+// sendMouse 通过现有视频连接发送带类型的控制消息，仅移动事件在积压时允许丢弃。
+function sendMouse(msg) {
+  if(!ws || ws.readyState!==WebSocket.OPEN) return;
+  if(!mouseReady && !(relaySession && (msg.action==='heartbeat' || msg.action==='release'))) return;
+  if(msg.action==='move' && ws.bufferedAmount>4096) return;
+  const mouse={type:'mouse',...msg};
+  ws.send(JSON.stringify(relaySession?{type:'control',device:relayDevice,session:relaySession,mouse}:mouse));
+}
+
+// mousePoint 将 CSS 像素位置映射为视频内容的归一化坐标；排除留白，拖动时可钳制到边缘，无需乘设备像素比。
+function mousePoint(event,clamp=false) {
+  if(!canvas.width || !canvas.height) return null;
+  const rect=canvas.getBoundingClientRect();
+  const scale=Math.min(rect.width/canvas.width,rect.height/canvas.height);
+  if(!scale) return null;
+  const width=canvas.width*scale,height=canvas.height*scale;
+  let x=(event.clientX-rect.left-(rect.width-width)/2)/width;
+  let y=(event.clientY-rect.top-(rect.height-height)/2)/height;
+  if(!clamp && (x<0 || x>1 || y<0 || y>1)) return null;
+  return {x:Math.max(0,Math.min(1,x)),y:Math.max(0,Math.min(1,y))};
+}
+
+// releaseMouse 在失焦、停止、隐藏和退出控制时通知服务端释放所有按键，并清除本地拖动状态。
+function releaseMouse() {
+  sendMouse({action:'release'});held.clear();mouseToggle.checked=false;
+}
+
+// mouseDown 将左右按下立即发送，采用浏览器点击计数生成原生单击或双击，不受移动限频影响。
+function mouseDown(event) {
+  if(!mouseToggle.checked || !mouseReady || !decoder || waiting || event.button>2 || event.button===1) return;
+  const point=mousePoint(event);if(!point) return;
+  event.preventDefault();
+  const button=event.button===2?1:0;
+  held.add(button);
+  sendMouse({action:'down',...point,button,clicks:Math.min(event.detail||1,2)});
+}
+
+// mouseMove 将移动限制在每秒至多约 30 次；拖动可越出画面，其位置钳制到视频边界。
+function mouseMove(event) {
+  if(!mouseToggle.checked || !mouseReady || !decoder || waiting) return;
+  if(!held.size && event.target!==canvas) return;
+  const point=mousePoint(event,held.size>0);if(!point) return;
+  const now=performance.now();if(now-lastMove<1000/30) return;lastMove=now;
+  sendMouse({action:'move',...point});
+}
+
+// mouseUp 在文档范围内立即发送释放；即使鼠标移出视频，也不会遗留按下状态。
+function mouseUp(event) {
+  const button=event.button===2?1:0;
+  if(event.button===1 || !held.has(button)) return;
+  const point=mousePoint(event,true);
+  if(point) sendMouse({action:'up',...point,button});else sendMouse({action:'release'});
+  held.delete(button);
+}
+
+// mouseWheel 将不同浏览器滚轮单位换算为有限的像素滚动量，仅在视频内控制时阻止页面滚动。
+function mouseWheel(event) {
+  if(!mouseToggle.checked || !mouseReady || !decoder || waiting) return;
+  const point=mousePoint(event);if(!point) return;
+  event.preventDefault();
+  const unit=event.deltaMode===1?16:event.deltaMode===2?canvas.getBoundingClientRect().height:1;
+  const delta=Math.max(-600,Math.min(600,Math.round(event.deltaY*unit)));
+  if(delta) sendMouse({action:'wheel',...point,delta});
+}
+
+// mouseContext 在鼠标控制开启时屏蔽浏览器菜单，让右键由被控桌面处理。
+function mouseContext(event) {if(mouseToggle.checked) event.preventDefault();}
+
+// mouseVisibility 页面进入后台时终止控制，服务端保活超时也会释放断线残留按键。
+function mouseVisibility() {if(document.hidden) releaseMouse();}
+
+// mouseEscape 允许用 Esc 立即停止鼠标控制，保留视频播放。
+function mouseEscape(event) {if(event.key==='Escape') releaseMouse();}
+
+// mouseChanged 在取消勾选时释放服务端按键，避免控制开关切换中残留拖动。
+function mouseChanged() {if(!mouseToggle.checked) releaseMouse();}
+
+canvas.addEventListener('mousedown',mouseDown);
+canvas.addEventListener('contextmenu',mouseContext);
+canvas.addEventListener('wheel',mouseWheel,{passive:false});
+document.addEventListener('mousemove',mouseMove);
+document.addEventListener('mouseup',mouseUp);
+document.addEventListener('visibilitychange',mouseVisibility);
+document.addEventListener('keydown',mouseEscape);
+window.addEventListener('blur',releaseMouse);
+window.addEventListener('pagehide',releaseMouse);
+mouseToggle.addEventListener('change',mouseChanged);
+</script>
+</html>

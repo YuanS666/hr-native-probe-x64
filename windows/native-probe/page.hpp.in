@@ -1,0 +1,3 @@
+#pragma once
+inline const char* probePage = R"PROBE_HTML(@PROBE_HTML@)PROBE_HTML";
+inline const char* probeScript = R"PROBE_JS(@PROBE_JS@)PROBE_JS";
