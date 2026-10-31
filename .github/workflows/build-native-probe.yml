@@ -1,0 +1,48 @@
+name: Build Windows Native Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-native-probe.yml'
+      - 'windows/native-probe/**'
+      - 'index.html'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Configure x64 Release
+        run: cmake -S windows/native-probe -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build native executable
+        run: cmake --build build --config Release --parallel 2
+      - name: Run bitstream tests (no desktop capture in CI)
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Prepare executable and dependency report
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact | Out-Null
+          Copy-Item build/Release/screen_native_probe.exe artifact/
+          Copy-Item windows/native-probe/README.md artifact/
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'Visual Studio C++ toolchain not found' }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents artifact/screen_native_probe.exe | Tee-Object artifact/dependencies.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency inspection failed' }
+          Get-FileHash artifact/screen_native_probe.exe -Algorithm SHA256 | Format-List | Out-File artifact/SHA256.txt
+          "Commit: $env:GITHUB_SHA`nWindows compilation and bitstream tests passed. Desktop capture, MF encoding and browser playback are NOT verified by CI." | Out-File artifact/BUILD-STATUS.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-native-probe-x64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
