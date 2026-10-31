@@ -7,6 +7,7 @@ on:
       - '.github/workflows/build-native-probe.yml'
       - 'windows/native-probe/**'
       - 'index.html'
+      - 'mouse_test.cjs'
       - '*.go'
       - 'go.mod'
       - 'windows/MF_AGENT.md'
@@ -43,6 +44,18 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path agent-artifact | Out-Null
           go build -o agent-artifact/screen-agent-windows-amd64.exe .
+      - name: Test browser mouse focus handling
+        run: node mouse_test.cjs
+      - name: Build Linux Relay with updated browser page
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force -Path relay-artifact | Out-Null
+          go build -o relay-artifact/screen-relay .
+          if ($LASTEXITCODE -ne 0) { throw 'Linux Relay build failed' }
+          Copy-Item windows/MF_AGENT.md relay-artifact/README.md
       - name: Prepare executable and dependency report
         shell: pwsh
         run: |
@@ -75,5 +88,11 @@ jobs:
         with:
           name: windows-agent-mf-x64
           path: agent-artifact/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-relay-amd64
+          path: relay-artifact/
           if-no-files-found: error
           retention-days: 7
