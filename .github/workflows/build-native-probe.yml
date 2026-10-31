@@ -7,6 +7,9 @@ on:
       - '.github/workflows/build-native-probe.yml'
       - 'windows/native-probe/**'
       - 'index.html'
+      - '*.go'
+      - 'go.mod'
+      - 'windows/MF_AGENT.md'
 
 permissions:
   contents: read
@@ -25,12 +28,29 @@ jobs:
         run: cmake --build build --config Release --parallel 2
       - name: Run bitstream tests (no desktop capture in CI)
         run: ctest --test-dir build -C Release --output-on-failure
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Test Agent native protocol and child-process cleanup
+        env:
+          CGO_ENABLED: '0'
+        run: go test -count=1 -run '^TestNative' .
+      - name: Build Windows Agent
+        env:
+          CGO_ENABLED: '0'
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory -Force -Path agent-artifact | Out-Null
+          go build -o agent-artifact/screen-agent-windows-amd64.exe .
       - name: Prepare executable and dependency report
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path artifact | Out-Null
           Copy-Item build/Release/screen_native_probe.exe artifact/
           Copy-Item windows/native-probe/README.md artifact/
+          Copy-Item build/Release/screen_native_probe.exe agent-artifact/screen_capture.exe
+          Copy-Item windows/MF_AGENT.md agent-artifact/README.md
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'Visual Studio C++ toolchain not found' }
@@ -40,9 +60,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Dependency inspection failed' }
           Get-FileHash artifact/screen_native_probe.exe -Algorithm SHA256 | Format-List | Out-File artifact/SHA256.txt
           "Commit: $env:GITHUB_SHA`nWindows compilation and bitstream tests passed. Desktop capture, MF encoding and browser playback are NOT verified by CI." | Out-File artifact/BUILD-STATUS.txt
+          Copy-Item artifact/dependencies.txt agent-artifact/capture-dependencies.txt
+          & $dumpbin.FullName /dependents agent-artifact/screen-agent-windows-amd64.exe | Out-File agent-artifact/agent-dependencies.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Agent dependency inspection failed' }
+          Get-FileHash agent-artifact/*.exe -Algorithm SHA256 | Format-List | Out-File agent-artifact/SHA256.txt
+          "Commit: $env:GITHUB_SHA`nAgent and helper compiled; native protocol/cleanup tests passed. Real Windows Agent video, mouse and public-network streaming are NOT verified by CI. MF software only; no FFmpeg required." | Out-File agent-artifact/BUILD-STATUS.txt
       - uses: actions/upload-artifact@v7
         with:
           name: windows-native-probe-x64
           path: artifact/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-agent-mf-x64
+          path: agent-artifact/
           if-no-files-found: error
           retention-days: 7
