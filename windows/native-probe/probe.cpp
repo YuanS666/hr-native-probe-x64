@@ -35,15 +35,6 @@ using probe::Bytes;
 using probe::require;
 namespace fs = std::filesystem;
 
-// checked 将系统 HRESULT 与调用位置一并报告，失败立即停止而不无限重试。
-static void checked(HRESULT hr, const char* where) {
-    if (FAILED(hr)) {
-        std::ostringstream s;
-        s << where << " HRESULT=0x" << std::hex << static_cast<unsigned long>(hr);
-        throw std::runtime_error(s.str());
-    }
-}
-
 // nowMS 读取单调 QPC 毫秒时钟，供同进程耗时和帧率测量。
 static double nowMS() {
     LARGE_INTEGER counter, frequency;
@@ -58,6 +49,60 @@ static std::string utf8(const wchar_t* text) {
     std::string out(static_cast<std::size_t>(n),0);
     WideCharToMultiByte(CP_UTF8,0,text,-1,out.data(),n,nullptr,nullptr);
     out.pop_back(); return out;
+}
+
+struct CaptureTrace {
+    const char* phase="init";
+    bool frame=false,duplication=false;
+    unsigned initialized=0,released=0,acquired=0,returned=0,releaseCalls=0;
+    double lastSuccess=0;
+    std::string adapter="unknown",output="unknown";
+};
+static CaptureTrace trace;
+
+// objectName 只查询窗口站或桌面名称，失败时保留Win32错误，不申请控制安全桌面的权限。
+static std::string objectName(HANDLE object) {
+    wchar_t name[256]{};DWORD needed=0;
+    if(!object || !GetUserObjectInformationW(object,UOI_NAME,name,sizeof(name),&needed))
+        return "unavailable:"+std::to_string(GetLastError());
+    return utf8(name);
+}
+
+// diagnostic 记录失败现场及资源计数，区分线程桌面、输入桌面、拓扑和最后一次成功采集时间。
+static void diagnostic(const char* api,HRESULT hr) {
+    DWORD session=0;ProcessIdToSessionId(GetCurrentProcessId(),&session);
+    HDESK input=OpenInputDesktop(0,FALSE,DESKTOP_READOBJECTS);
+    DWORD inputError=input?0:GetLastError();
+    std::string inputName=input?objectName(input):"denied:"+std::to_string(inputError);
+    if(input) CloseDesktop(input);
+    std::ostringstream line;
+    line<<"DXGI utc_ms="<<std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()<<" phase="<<trace.phase<<" api="<<api<<" hr=0x"<<std::hex<<static_cast<unsigned long>(hr)<<std::dec
+        <<" pid="<<GetCurrentProcessId()<<" session="<<session<<" console="<<WTSGetActiveConsoleSessionId()
+        <<" tid="<<GetCurrentThreadId()<<" station="<<objectName(GetProcessWindowStation())
+        <<" thread_desktop="<<objectName(GetThreadDesktop(GetCurrentThreadId()))<<" input_desktop="<<inputName
+        <<" primary="<<GetSystemMetrics(SM_CXSCREEN)<<"x"<<GetSystemMetrics(SM_CYSCREEN)
+        <<" monitors="<<GetSystemMetrics(SM_CMONITORS)<<" adapter="<<trace.adapter<<" output="<<trace.output
+        <<" holding_dup="<<trace.duplication<<" holding_frame="<<trace.frame
+        <<" init="<<trace.initialized<<" cleanup="<<trace.released
+        <<" acquired="<<trace.acquired<<" release_calls="<<trace.releaseCalls<<" returned="<<trace.returned
+        <<" last_success_age_ms="<<(trace.lastSuccess?nowMS()-trace.lastSuccess:-1);
+    std::cerr<<line.str()<<"\n";
+}
+
+struct NativeFailure : std::runtime_error {
+    bool retry;
+    // NativeFailure 保留具体API/HRESULT，只有已分类的桌面或设备切换错误允许Go有限恢复。
+    NativeFailure(HRESULT hr,const char* api,bool recover):std::runtime_error(api),retry(recover) {
+        diagnostic(api,hr);
+    }
+};
+
+// checked 对系统错误输出完整现场；原生进程退出后由Go回收并重建整个图形资源链。
+static void checked(HRESULT hr,const char* api) {
+    if(SUCCEEDED(hr)) return;
+    bool retry=hr==DXGI_ERROR_ACCESS_LOST || hr==E_ACCESSDENIED || hr==DXGI_ERROR_DEVICE_REMOVED
+        || hr==DXGI_ERROR_DEVICE_RESET || hr==DXGI_ERROR_SESSION_DISCONNECTED;
+    throw NativeFailure(hr,api,retry);
 }
 
 struct Runtime {
@@ -113,13 +158,19 @@ static Options options(int argc,wchar_t** argv) {
 // ordinaryDesktop 拒绝服务、RDP 和安全桌面，只验证已登录物理控制台的普通桌面。
 static void ordinaryDesktop() {
     DWORD session=0;
-    require(ProcessIdToSessionId(GetCurrentProcessId(),&session)&&session!=0&&session==WTSGetActiveConsoleSessionId(),"run in the logged-in physical console, not service/RDP");
+    require(ProcessIdToSessionId(GetCurrentProcessId(),&session)&&session!=0,"run in a logged-in user session, not service");
+    DWORD console=WTSGetActiveConsoleSessionId();
+    if(console==0xffffffff) throw NativeFailure(DXGI_ERROR_SESSION_DISCONNECTED,"physical console temporarily disconnected",true);
+    require(session==console,"run in the logged-in physical console, not another user/RDP");
+    require(objectName(GetProcessWindowStation())=="WinSta0","run on interactive WinSta0 only");
     HDESK desktop=OpenInputDesktop(0,FALSE,DESKTOP_READOBJECTS);
-    require(desktop!=nullptr,"cannot open input desktop (locked/UAC?)");
-    wchar_t name[128]{};DWORD length=0;
-    BOOL ok=GetUserObjectInformationW(desktop,UOI_NAME,name,sizeof(name),&length);
+    if(!desktop) throw NativeFailure(HRESULT_FROM_WIN32(GetLastError()),"OpenInputDesktop",true);
+    std::string name=objectName(desktop);
     CloseDesktop(desktop);
-    require(ok&&std::wstring(name)==L"Default","only Default desktop is supported");
+    if(name!="Default") throw NativeFailure(E_ACCESSDENIED,"input desktop is not Default; capture paused",true);
+    // 不切换到其他桌面；同名但不同对象的场景通过日志和新的采集进程诊断。
+    if(objectName(GetThreadDesktop(GetCurrentThreadId()))!=name)
+        throw NativeFailure(E_ACCESSDENIED,"thread/input desktop mismatch",true);
 }
 
 struct Capture {
@@ -136,11 +187,12 @@ struct Capture {
     DXGI_ADAPTER_DESC1 adapter{};
     UINT sourceW=0,sourceH=0;
     RECT content{};
-    bool haveFrame=false,recovered=false;
+    bool haveFrame=false;
     UINT64 fresh=0,repeated=0;
 
     // Capture 选择真实主屏对应 adapter，初始化物理尺寸和 GPU 色彩转换，不选择任意独显。
-    explicit Capture(const Options& o) {
+    explicit Capture(const Options& o) try {
+        trace.phase="init";++trace.initialized;
         ordinaryDesktop();
         require(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)!=FALSE,"SetProcessDpiAwarenessContext failed; run without DPI compatibility overrides");
         ComPtr<IDXGIFactory1> factory;
@@ -165,7 +217,7 @@ struct Capture {
                 }
             }
         }
-        require(selected&&output,"no attached primary display");
+        if(!selected || !output) throw NativeFailure(DXGI_ERROR_NOT_FOUND,"no attached primary display",true);
         require(desc.Rotation==DXGI_MODE_ROTATION_IDENTITY,"rotated primary display is not supported by this probe");
         ComPtr<IDXGIOutput6> modernOutput;
         if(SUCCEEDED(output.As(&modernOutput))) {
@@ -174,6 +226,9 @@ struct Capture {
             require(color.ColorSpace==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,"probe supports SDR only; disable HDR for this test");
         }
         checked(selected->GetDesc1(&adapter),"Get adapter description");
+        trace.adapter=utf8(adapter.Description)+" LUID="+std::to_string(adapter.AdapterLuid.HighPart)+":"+std::to_string(adapter.AdapterLuid.LowPart);
+        trace.output=utf8(desc.DeviceName)+" rect="+std::to_string(desc.DesktopCoordinates.left)+","+std::to_string(desc.DesktopCoordinates.top)+","+std::to_string(desc.DesktopCoordinates.right)+","+std::to_string(desc.DesktopCoordinates.bottom);
+        diagnostic("selected adapter/output",S_OK);
         UINT flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT|D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
         D3D_FEATURE_LEVEL level;
         checked(D3D11CreateDevice(selected.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,flags,nullptr,0,D3D11_SDK_VERSION,&device,&level,&context),"D3D11CreateDevice");
@@ -182,7 +237,8 @@ struct Capture {
         checked(context.As(&multithread),"ID3D10Multithread");
         multithread->SetMultithreadProtected(TRUE);
         require(multithread->GetMultithreadProtected()!=FALSE,"D3D11 multithread protection unavailable");
-        restoreDuplication();
+        checked(output->DuplicateOutput(device.Get(),&duplication),"DuplicateOutput");
+        trace.duplication=true;
         DXGI_OUTDUPL_DESC du{};duplication->GetDesc(&du);
         sourceW=du.ModeDesc.Width;sourceH=du.ModeDesc.Height;
         require(sourceW>=2&&sourceH>=2&&du.ModeDesc.Format==DXGI_FORMAT_B8G8R8A8_UNORM,"probe requires BGRA8 SDR capture");
@@ -228,60 +284,71 @@ struct Capture {
                  <<" primary="<<sourceW<<"x"<<sourceH<<" output="<<o.width<<"x"<<o.height
                  <<" content="<<left<<","<<top<<","<<w<<","<<h<<"\n";
         std::cerr<<"SDR primary only; cursor composition and HDR are not validated. No audio/input/network.\n";
+    } catch(...) {
+        // 构造失败时成员COM指针已自动析构，此处仅记录已完成的清理，不访问失效成员。
+        trace.phase="init-cleanup";trace.duplication=false;trace.frame=false;++trace.released;
+        diagnostic("partial initialization released",S_OK);
+        throw;
     }
 
-    // restoreDuplication 在原普通桌面上有限退避重建采集接口，拒绝权限绕过、设备丢失及尺寸变化。
-    void restoreDuplication() {
-        duplication.Reset();haveFrame=false;
-        for(unsigned attempt=0;attempt<10;++attempt) {
-            ordinaryDesktop();
-            checked(device->GetDeviceRemovedReason(),"capture D3D device removed; restart required");
-            HRESULT hr=output->DuplicateOutput(device.Get(),&duplication);
-            if(SUCCEEDED(hr)) {
-                DXGI_OUTDUPL_DESC du{};duplication->GetDesc(&du);
-                DXGI_OUTPUT_DESC desc{};checked(output->GetDesc(&desc),"restored output description");
-                require(desc.AttachedToDesktop && desc.Monitor==MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY)
-                    && desc.Rotation==DXGI_MODE_ROTATION_IDENTITY,"primary display changed; restart required");
-                require(du.ModeDesc.Format==DXGI_FORMAT_B8G8R8A8_UNORM
-                    && (!sourceW || (du.ModeDesc.Width==sourceW && du.ModeDesc.Height==sourceH)),
-                    "capture dimensions/format changed; restart required");
-                recovered=true;
-                if(attempt) std::cerr<<"desktop duplication restored; next input requests IDR\n";
-                return;
-            }
-            if(hr!=E_ACCESSDENIED && hr!=DXGI_ERROR_ACCESS_LOST && hr!=DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
-                checked(hr,"DuplicateOutput recovery");
-            if(attempt==9) checked(hr,"DuplicateOutput recovery exhausted (10 attempts)");
-            DWORD delay=attempt==0?250:attempt==1?500:attempt==2?1000:2000;
-            std::cerr<<"desktop duplication unavailable; retry "<<(attempt+1)<<"/9 in "<<delay<<" ms\n";
-            Sleep(delay);
-        }
+    // releaseFrame 只归还已经取得的帧，异常清理时记录失败但不覆盖最初的故障原因。
+    void releaseFrame(bool check) {
+        if(!trace.frame) return;
+        trace.phase="release";
+        HRESULT hr=duplication->ReleaseFrame();
+        trace.frame=false;++trace.releaseCalls;
+        if(SUCCEEDED(hr)) ++trace.returned;
+        if(check) checked(hr,"ReleaseFrame");
+        else if(FAILED(hr)) diagnostic("ReleaseFrame during cleanup",hr);
     }
 
-    // next 复制新桌面帧后立即归还 duplication 资源；静止时重复自有纹理，首次没有画面不能伪造黑帧。
-    void next() {
+    // ~Capture 依次释放帧、转换视图、纹理、Duplication和设备，进程退出前报告配对计数。
+    ~Capture() {
+        releaseFrame(false);trace.phase="cleanup";
+        inputView.Reset();processor.Reset();videoEnum.Reset();bgra.Reset();
+        duplication.Reset();trace.duplication=false;output.Reset();
+        videoContext.Reset();videoDevice.Reset();
+        if(context) {context->ClearState();context->Flush();}
+        context.Reset();device.Reset();++trace.released;
+        diagnostic("capture resources released",S_OK);
+    }
+
+    // next 超时正常返回；成功Acquire后只Release一次，失效时退出以完整重建而非复用旧设备。
+    bool next() {
+        trace.phase="capture";
         ordinaryDesktop();
+        if(UINT(GetSystemMetrics(SM_CXSCREEN))!=sourceW || UINT(GetSystemMetrics(SM_CYSCREEN))!=sourceH)
+            throw NativeFailure(DXGI_ERROR_ACCESS_LOST,"primary resolution changed",true);
+        DXGI_OUTPUT_DESC current{};checked(output->GetDesc(&current),"GetDesc before capture");
+        if(!current.AttachedToDesktop || current.Monitor!=MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY))
+            throw NativeFailure(DXGI_ERROR_ACCESS_LOST,"primary output changed",true);
         DXGI_OUTDUPL_FRAME_INFO info{};
         ComPtr<IDXGIResource> resource;
         HRESULT hr=duplication->AcquireNextFrame(haveFrame?0:1000,&info,&resource);
-        if(hr==DXGI_ERROR_ACCESS_LOST) {
-            std::cerr<<"desktop duplication access lost; rebuilding on ordinary desktop\n";
-            restoreDuplication();
-            hr=duplication->AcquireNextFrame(1000,&info,&resource);
+        if(hr==DXGI_ERROR_WAIT_TIMEOUT) {if(haveFrame) ++repeated;return haveFrame;}
+        if(FAILED(hr)) {
+            HRESULT removed=device->GetDeviceRemovedReason();
+            diagnostic("AcquireNextFrame",hr);
+            checked(removed,"GetDeviceRemovedReason after AcquireNextFrame");
+            checked(hr,"AcquireNextFrame");
         }
-        if(hr==DXGI_ERROR_WAIT_TIMEOUT) {require(haveFrame,"no initial desktop frame within 1s");++repeated;return;}
-        checked(hr,"AcquireNextFrame (recovery failed or desktop unavailable)");
+        trace.frame=true;++trace.acquired;
         try {
             if(info.LastPresentTime.QuadPart>0||!haveFrame) {
                 ComPtr<ID3D11Texture2D> texture;
                 checked(resource.As(&texture),"desktop texture");
                 D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
-                require(desc.Width==sourceW&&desc.Height==sourceH&&desc.Format==DXGI_FORMAT_B8G8R8A8_UNORM,"capture layout/format changed");
+                if(desc.Width!=sourceW || desc.Height!=sourceH || desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM)
+                    throw NativeFailure(DXGI_ERROR_ACCESS_LOST,"captured texture layout changed",true);
                 context->CopyResource(bgra.Get(),texture.Get());
+                checked(device->GetDeviceRemovedReason(),"GetDeviceRemovedReason after CopyResource");
                 haveFrame=true;++fresh;
             } else ++repeated;
-        } catch(...) {duplication->ReleaseFrame();throw;}
-        checked(duplication->ReleaseFrame(),"ReleaseFrame");
+            trace.lastSuccess=nowMS();
+        } catch(...) {resource.Reset();releaseFrame(false);throw;}
+        resource.Reset();releaseFrame(true);
+        trace.phase="convert";
+        return true;
     }
 
     // nv12 为本次输入创建独立 NV12 纹理，避免异步 MFT 尚在读取时被下一帧覆盖。
@@ -320,7 +387,11 @@ struct Capture {
             checked(buffer->Lock(&destination,nullptr,nullptr),"lock NV12 buffer");
             D3D11_MAPPED_SUBRESOURCE map{};
             HRESULT hr=context->Map(staging.Get(),0,D3D11_MAP_READ,0,&map);
-            if(FAILED(hr)) {buffer->Unlock();checked(hr,"map NV12 readback");}
+            if(FAILED(hr)) {
+                buffer->Unlock();diagnostic("map NV12 readback",hr);
+                checked(device->GetDeviceRemovedReason(),"GetDeviceRemovedReason after Map");
+                checked(hr,"map NV12 readback");
+            }
             for(UINT row=0;row<o.height*3/2;++row)
                 std::memcpy(destination+std::size_t(row)*o.width,static_cast<BYTE*>(map.pData)+std::size_t(row)*map.RowPitch,o.width);
             context->Unmap(staging.Get(),0);
@@ -731,7 +802,7 @@ struct Meter {
 int wmain(int argc,wchar_t** argv) {
     try {
         Options opt=options(argc,argv);
-        std::cerr<<"native-capture revision=5 (bounded desktop duplication recovery)\n";
+        std::cerr<<"native-capture revision=6 (diagnosed capture exits; full resource rebuild by Agent)\n";
         Runtime runtime;
         Capture capture(opt);
         Files files(opt);
@@ -741,19 +812,21 @@ int wmain(int argc,wchar_t** argv) {
         LONGLONG duration=10000000/opt.fps,nextKey=0,lastPTS=-duration;
         double began=nowMS(),nextTick=began,lastStats=began,lastProgress=began;
         while(opt.stream||(submitted<UINT64(opt.seconds)*opt.fps&&nowMS()-began<double(opt.seconds)*1000)) {
+            trace.phase="encode";
             encoder.pump();
             double time=nowMS();
             if(time-lastStats>=1000) {meter.write(files,capture,submitted,began);lastStats=time;}
             require(time-lastProgress<5000,"no accepted input/output progress for 5s");
             if(!encoder.pending.empty()) require(time-encoder.pending.begin()->second<5000,"oldest encoded frame pending for 5s");
             if(!encoder.ready()||time<nextTick) {Sleep(1);continue;}
-            capture.next();auto texture=capture.nv12(opt);
+            if(!capture.next()) {lastProgress=nowMS();continue;}
+            auto texture=capture.nv12(opt);
             // 正常固定节奏；编码过慢时保留实际时间缺口，不高速补发旧画面。
             LONGLONG pts=submitted==0?0:std::max(lastPTS+duration,LONGLONG((nowMS()-began)*10000/duration)*duration);
             auto sample=capture.sample(opt,texture.Get(),encoder.hardware,pts,duration);
-            bool key=capture.recovered || pts>=nextKey;
+            bool key=pts>=nextKey;
+            trace.phase="encode";
             encoder.submit(sample.Get(),pts,key);
-            capture.recovered=false;
             if(key) nextKey=pts+10000000;
             ++submitted;lastPTS=pts;lastProgress=nowMS();nextTick=std::max(nextTick+1000.0/opt.fps,lastProgress);
         }
@@ -762,8 +835,12 @@ int wmain(int argc,wchar_t** argv) {
         require(files.keys>=2,"no second IDR; recovery cannot be validated");
         meter.write(files,capture,submitted,began);files.finish(opt);
         return 0;
+    } catch(const NativeFailure& e) {
+        std::cerr<<"CAPTURE_EXIT code="<<(e.retry?75:1)<<" reason="<<e.what()<<"; all process resources will be reclaimed\n";
+        return e.retry?75:1;
     } catch(const std::exception& e) {
-        std::cerr<<"FAILED: "<<e.what()<<"\nPartial files are NOT a successful validation; use a new output prefix after fixing the cause.\n";
+        diagnostic("unclassified failure",E_FAIL);
+        std::cerr<<"CAPTURE_EXIT code=1 reason="<<e.what()<<"\nFAILED: "<<e.what()<<"\nPartial files are NOT a successful validation; use a new output prefix after fixing the cause.\n";
         return 1;
     }
 }

@@ -12,10 +12,7 @@ if($Mode -eq 'info') {
     Get-CimInstance Win32_ComputerSystem | Select-Object SystemType,NumberOfLogicalProcessors
     & $AgentPath -check-permissions
     if(Get-Command go -ErrorAction SilentlyContinue) {go version}
-    if(!(Get-Command ffmpeg -ErrorAction SilentlyContinue)) {throw 'FFmpeg not found in PATH'}
-    ffmpeg -version
-    ffmpeg -hide_banner -h demuxer=gdigrab
-    ffmpeg -hide_banner -h encoder=libx264
+    Write-Host 'MF默认路径无需FFmpeg；系统组件可用性以Agent启动和实际采集日志为准。'
     exit
 }
 
@@ -81,7 +78,7 @@ while($clock.Elapsed.TotalSeconds -lt $DurationSeconds) {
     $agent=Get-Process -Id $AgentProcessId -ErrorAction SilentlyContinue
     if(!$agent) {throw "Agent exited before the requested duration. Evidence: $OutputPath"}
     $processes=@($agent)
-    $children=Get-CimInstance Win32_Process -Filter "ParentProcessId = $AgentProcessId AND Name = 'ffmpeg.exe'"
+    $children=Get-CimInstance Win32_Process -Filter "ParentProcessId = $AgentProcessId AND (Name = 'screen_capture.exe' OR Name = 'ffmpeg.exe')"
     foreach($child in $children) {
         $process=Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue
         if($process) {$processes+=$process}
@@ -101,7 +98,7 @@ while($clock.Elapsed.TotalSeconds -lt $DurationSeconds) {
             $current[$id]=@{Time=$elapsed;CPU=$cpu}
         } catch {
             if($process.Id -eq $AgentProcessId) {throw}
-            Write-Warning 'FFmpeg exited during sampling; correlate with Agent logs.'
+            Write-Warning 'Capture child exited during sampling; correlate with Agent recovery logs.'
         }
     }
     $previous=$current

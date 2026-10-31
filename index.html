@@ -6,6 +6,7 @@
 <h1>H.264 + WebSocket</h1>
 <button id="start">开始</button> <button id="stop">停止</button>
 <label><input id="mouse" type="checkbox" disabled>鼠标控制（Esc 停用）</label>
+<p id="capture-status">采集状态：尚未开始</p>
 <p id="mouse-status">连接后检查鼠标控制状态</p>
 <pre id="stats">未连接</pre>
 <p>本地延迟为 Go 收到完整编码帧 → canvas 提交的估计值，不含采集、编码及屏幕实际显示。跨机模式未同步时钟，无法可靠测量单向视频延迟。解码耗时含浏览器排队。</p>
@@ -13,6 +14,7 @@
 <script>
 const canvas=document.querySelector('#screen'), ctx=canvas.getContext('2d');
 const stats=document.querySelector('#stats');
+const captureStatus=document.querySelector('#capture-status');
 const mouseToggle=document.querySelector('#mouse'),mouseStatus=document.querySelector('#mouse-status');
 let mouseSuspended=false;
 let mouseReady=false,lastMove=0,held=new Set();
@@ -61,8 +63,17 @@ function message(event) {
       if(value.type==='relay-session') {
         resetDecoder();config=null;relayDevice=value.device;relaySession=value.session;return;
       }
+      if(value.type==='capture-status') {
+        captureStatus.textContent='采集 '+value.state+'：'+value.message;
+        if(value.state!=='running') {
+          releaseMouse(false);mouseReady=false;mouseToggle.disabled=true;
+          resetDecoder();config=null;
+        }
+        return;
+      }
       if(value.type==='mouse-status') {
         mouseReady=value.enabled===true;mouseToggle.disabled=!mouseReady;
+        if(!mouseReady) {sendMouse({action:'release'});held.clear();}
         mouseStatus.textContent=value.message;return;
       }
       if(value.error) { showError(value.error); return; }

@@ -117,6 +117,9 @@ func TestNativeProcessHelper(t *testing.T) {
 	} else {
 		os.Stdout.Write(nativeTestRecord(nativeTestPacket(0, true)))
 	}
+	if mode == "recoverable" {
+		os.Exit(75)
+	}
 	if mode == "exit" {
 		os.Exit(9)
 	}
@@ -188,6 +191,25 @@ func TestNativeProcessFailures(t *testing.T) {
 		}
 		if strings.HasPrefix(mode, "send-eof") && (!errors.Is(err, io.EOF) || strings.Contains(err.Error(), "意外结束")) {
 			t.Fatalf("网络发送EOF被误报为编码进程退出: %v", err)
+		}
+	}
+}
+
+// TestNativeExitClassification 用真实子进程确认退出码75保留为可恢复故障，未知退出码不进入重试。
+func TestNativeExitClassification(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"recoverable", "exit"} {
+		t.Setenv("SCREEN_NATIVE_TEST_HELPER", mode)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 测试发送端接受完整帧，确保本次退出来自子进程而非网络取消。
+		err = runNativeVideo(ctx, self, []string{"-test.run=^TestNativeProcessHelper$"}, func(byte, []byte) error { return nil })
+		cancel()
+		var failure *nativeCaptureError
+		if !errors.As(err, &failure) || failure.retry != (mode == "recoverable") {
+			t.Fatalf("退出码分类 mode=%s err=%v", mode, err)
 		}
 	}
 }

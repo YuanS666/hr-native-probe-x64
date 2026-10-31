@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,13 +19,34 @@ import (
 
 const maxNativePacket = (16 << 20) + 17
 
+// nativeCaptureError 区分可恢复的桌面/设备故障与永久失败，错误正文不包含认证信息。
+type nativeCaptureError struct {
+	cause error
+	retry bool
+}
+
+// Error 返回原生进程退出原因，供日志与采集状态展示。
+func (e *nativeCaptureError) Error() string { return e.cause.Error() }
+
+// Unwrap 保留底层错误，避免把网络发送失败错误地当成可重试采集故障。
+func (e *nativeCaptureError) Unwrap() error { return e.cause }
+
+// captureRetryDelay 为一次观看会话提供六次有限退避；持续失败后必须人工重新开始。
+func captureRetryDelay(attempt int) (time.Duration, bool) {
+	delays := [...]time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+	if attempt < 0 || attempt >= len(delays) {
+		return 0, false
+	}
+	return delays[attempt], true
+}
+
 // encodeMFVideo 从Agent自身目录启动配套系统软件H264程序，参数沿用现有视频设置，不搜索PATH或启动FFmpeg。
 func encodeMFVideo(ctx context.Context, send func(byte, []byte) error) error {
 	if *device != "desktop" || *testPattern {
-		return fmt.Errorf("MF 仅支持真实主屏 -device desktop，不支持 -test-pattern")
+		return &nativeCaptureError{cause: fmt.Errorf("MF 仅支持真实主屏 -device desktop，不支持 -test-pattern")}
 	}
 	if *width < 2 || *width > 3840 || *width%2 != 0 || *height < 2 || *height > 2160 || *height%2 != 0 || *fps < 1 || *fps > 60 || *bitrate < 10000 || *bitrate > 20000000 {
-		return fmt.Errorf("MF 输出需偶数尺寸≤3840×2160，FPS 1–60，码率10000–20000000")
+		return &nativeCaptureError{cause: fmt.Errorf("MF 输出需偶数尺寸≤3840×2160，FPS 1–60，码率10000–20000000")}
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -32,7 +54,7 @@ func encodeMFVideo(ctx context.Context, send func(byte, []byte) error) error {
 	}
 	helper := filepath.Join(filepath.Dir(self), "screen_capture.exe")
 	if _, err := os.Stat(helper); err != nil {
-		return fmt.Errorf("需要把配套 screen_capture.exe 与 Agent 放在同一目录: %w", err)
+		return &nativeCaptureError{cause: fmt.Errorf("需要把配套 screen_capture.exe 与 Agent 放在同一目录: %w", err)}
 	}
 	args := []string{"--stream", "--encoder", "software", "--width", strconv.Itoa(*width), "--height", strconv.Itoa(*height), "--fps", strconv.Itoa(*fps), "--bitrate", strconv.Itoa(*bitrate)}
 	return runNativeVideo(ctx, helper, args, send)
@@ -50,18 +72,27 @@ func runNativeVideo(parent context.Context, helper string, args []string, send f
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动系统 H264 编码进程: %w", err)
+		return &nativeCaptureError{cause: fmt.Errorf("启动系统 H264 编码进程: %w", err)}
 	}
+	log.Printf("原生采集启动 PID=%d（同一时刻仅一个子进程）", cmd.Process.Pid)
 	err = forwardNativeVideo(stdout, send)
-	stop()
+	// 正常EOF先保留子进程退出码；坏包/网络失败立即终止，关闭stdout后卡住也最多等待三秒。
+	if err != io.EOF {
+		stop()
+	}
+	grace := time.AfterFunc(3*time.Second, stop)
 	waitErr := cmd.Wait()
+	grace.Stop()
+	log.Printf("原生采集回收 PID=%d exit=%v pipe=%v", cmd.Process.Pid, waitErr, err)
 	if parent.Err() != nil {
 		return parent.Err()
 	}
 	if err != io.EOF {
 		return err
 	}
-	return fmt.Errorf("系统 H264 编码进程意外结束: %v（详细原因见原生日志）", waitErr)
+	var exit *exec.ExitError
+	retry := errors.As(waitErr, &exit) && exit.ExitCode() == 75
+	return &nativeCaptureError{cause: fmt.Errorf("系统 H264 编码进程意外结束: %v（详细原因见原生日志）", waitErr), retry: retry}
 }
 
 // forwardNativeVideo 按显式长度读取完整原协议包，校验AUD、IDR、参数集和PTS后发送；EOF始终交给进程管理处理。

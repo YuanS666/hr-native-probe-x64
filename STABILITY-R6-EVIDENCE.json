@@ -1,0 +1,76 @@
+{
+  "revision": 6,
+  "root_cause": "E_ACCESSDENIED trigger remains unconfirmed. Old recovery reused Output/Device/conversion resources; encoder exit closed Agent WSS. Both established by source review.",
+  "tests": [
+    {
+      "command": "go test -race -count=1 ./...",
+      "result": "PASS, screen-mvp 46.645s; deploy no test files; nonfatal macOS linker LC_DYSYMTAB warning"
+    },
+    {
+      "command": "go test -race -count=1 -run '^TestNativeAgent' .",
+      "result": "PASS; includes virtual-clock production backoff, mouse release, same-session recovery, retry exhaustion, permanent failure, cancellation and invalid device/session/coordinate rejection"
+    },
+    {
+      "command": "go test -race -count=1 -run '^(TestNative|TestAgent)' .",
+      "result": "PASS; real child cleanup and exit-75 classification"
+    },
+    {
+      "command": "node mouse_test.cjs",
+      "result": "PASS; 324 coordinate cases plus pause/resume/decoder lifecycle logical regression (no actual H264 decoder)"
+    },
+    {
+      "command": "cmake --build .cache/native-probe-build && ctest --test-dir .cache/native-probe-build --output-on-failure",
+      "result": "PASS; portable C++ only"
+    },
+    {
+      "command": "clang++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined windows/native-probe/bitstream_test.cpp -o /tmp/remote-bitstream-r6 && /tmp/remote-bitstream-r6 .cache/windows-validation/fixed.h264",
+      "result": "PASS; actual FFmpeg-generated fixture 40 AU / 2 IDR, not Windows MF capture"
+    },
+    {
+      "command": "go vet ./...",
+      "result": "PASS"
+    },
+    {
+      "command": "GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build .",
+      "result": "PASS (cross-build Go Agent)"
+    },
+    {
+      "command": "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build .",
+      "result": "PASS (Relay with updated embedded HTML)"
+    },
+    {
+      "command": "go build .",
+      "result": "PASS (native macOS Go build)"
+    }
+  ],
+  "not_verified": [
+    "revision 6 Windows native C++ compilation (requires CI/Windows SDK)",
+    "windows/build.ps1 execution (PowerShell unavailable here)",
+    "real DXGI E_ACCESSDENIED recovery, lock/unlock, display changes",
+    "30-minute real GUI stability and CPU/GPU/memory across restarts",
+    "actual updated public VPS + browser recovery, real Mac GUI regression"
+  ],
+  "unchanged_verified_by_sha256": [
+    "mouse_darwin.go",
+    "capture_darwin.go",
+    "relay.go",
+    "websocket.go",
+    "h264.go",
+    "go.mod"
+  ],
+  "modified_files": {
+    ".gitignore": "a3a443a48370532248ef066b71cb0210d3ec39b0dd2209d7ff0ad509a12869d6",
+    "agent.go": "3dbd12a13c05052fb1ca42ef8b8e400b64ac4dba47693ce426c040fc783376e7",
+    "native_video.go": "3b16cf30c0dcec536268ee841b42d501853b90f4814757dec99e1290541e33aa",
+    "native_video_test.go": "f0e5372857b3981756241d2578d1f460b8cd8d3f66b950a860484f46a8ad501c",
+    "agent_recovery_test.go": "84ad17f6dcbdd734cfc20f6696821d65cb080b095a08686cc534f571c59e93f6",
+    "index.html": "7895d4d0dd9d56bddcd6d2b52129bc65dcd00c87a720d60ae651792c97570ac2",
+    "mouse_test.cjs": "b2052dcf604f56ae9b7ed4f8cb5f7d16a5bc48fe7c219da0eaf168f65b459d68",
+    "windows/native-probe/probe.cpp": "aa9edd41c9b50bdc41ef1b734a173b4a84e39dbd88d1b44f751950d3463d53bb",
+    "windows/build.ps1": "3b6bbfc1a4c80df7f80451813fd8f58220cd87bd0fad24d087683ab9b74b6717",
+    "windows/validate.ps1": "60f4a176115a82a84856f729a03c3e3c08c7f57c622d67eb3a2e47366cfe0f30",
+    "windows/STABILITY.md": "4e847378648f7b942f2d3eb7d0db500452f5bdd936b139050dcc02e8bb19b0b4",
+    "windows/MF_AGENT.md": "72d94072a09f28d8de03772cc0d2ecbeaed9b2fa6b491945a31edbb590d650c7",
+    ".github/workflows/build-native-probe.yml": "4c69d0e75a68dcd7c26de243dffe4683ae28e21297caa6826a86d712889a2493"
+  }
+}

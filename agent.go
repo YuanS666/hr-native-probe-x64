@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -74,8 +75,69 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 	var mouse mouseController
 	var stopEncode context.CancelFunc
 	var encoded chan error
+	var ready chan struct{}
+	var retryTimer *time.Timer
+	var retryTick <-chan time.Time
+	var retries int
+	var runningSince time.Time
+	paused := false
+	nativeMode := *encoder == "mf"
+	// 采集状态沿用认证会话封装，Relay只转发，不增加第二套通道。
+	captureStatus := func(state, message string) error {
+		log.Printf("采集状态 %s: %s", state, message)
+		b, _ := json.Marshal(map[string]string{"type": "capture-status", "state": state, "message": message})
+		return sendAgentFrame(w, session, 1, b)
+	}
+	// 每次恢复都重新查询普通桌面权限和显示布局，不复用旧鼠标坐标映射。
+	reportMouse := func() error {
+		var err error
+		mouse, err = openMouse()
+		status := "原生鼠标控制可用，可勾选鼠标控制"
+		if err != nil {
+			status = err.Error()
+			mouse = nil
+		}
+		b, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil, "message": status})
+		return sendAgentFrame(w, session, 1, b)
+	}
+	// 上个进程已回收后才启动新编码器；新首帧必须经既有校验确认IDR和参数集。
+	launchEncode := func() {
+		videoCtx, stop := context.WithCancel(ctx)
+		stopEncode = stop
+		done := make(chan error, 1)
+		encoded = done
+		firstFrame := make(chan struct{}, 1)
+		ready = firstFrame
+		sid := session
+		runningSince = time.Time{}
+		go func() {
+			first := true
+			err := encode(videoCtx, func(op byte, b []byte) error {
+				if videoCtx.Err() != nil {
+					return videoCtx.Err()
+				}
+				if err := sendAgentFrame(w, sid, op, b); err != nil {
+					return err
+				}
+				if first && op == 2 {
+					first = false
+					firstFrame <- struct{}{}
+				}
+				return nil
+			})
+			done <- err
+		}()
+	}
 	// 先释放鼠标再等待编码退出，断开浏览器不会因视频写入阻塞而拖延按键清理。
 	stopSession := func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+			retryTimer = nil
+		}
+		retryTick = nil
+		ready = nil
+		retries = 0
+		paused = false
 		if mouse != nil {
 			mouse.release()
 			mouse = nil
@@ -95,12 +157,66 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-retryTick:
+			retryTick = nil
+			retryTimer = nil
+			if err := captureStatus("starting", "正在重新初始化桌面采集"); err != nil {
+				return err
+			}
+			launchEncode()
+		case <-ready:
+			ready = nil
+			if nativeMode {
+				runningSince = time.Now()
+				paused = false
+				if err := captureStatus("running", "已收到新IDR，采集恢复"); err != nil {
+					return err
+				}
+				if mouse != nil {
+					mouse.release()
+					mouse = nil
+				}
+				if err := reportMouse(); err != nil {
+					return err
+				}
+			}
 		case err := <-encoded:
 			encoded = nil
+			ready = nil
+			if stopEncode != nil {
+				stopEncode()
+				stopEncode = nil
+			}
+			var failure *nativeCaptureError
+			if nativeMode && errors.As(err, &failure) {
+				paused = true
+				if mouse != nil {
+					mouse.release()
+					mouse = nil
+				}
+				// 稳定运行一分钟才重置预算，防止短暂恢复造成无限高速重启。
+				if !runningSince.IsZero() && time.Since(runningSince) >= time.Minute {
+					retries = 0
+				}
+				delay, allowed := captureRetryDelay(retries)
+				if failure.retry && allowed {
+					retries++
+					if err := captureStatus("paused", fmt.Sprintf("%v；%s后完整重建，第%d/6次", failure, delay, retries)); err != nil {
+						return err
+					}
+					retryTimer = time.NewTimer(delay)
+					retryTick = retryTimer.C
+				} else {
+					if err := captureStatus("stopped", fmt.Sprintf("%v；自动恢复已停止，请检查原生日志后重新开始", failure)); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			sid := session
 			stopSession()
-			failure, _ := json.Marshal(map[string]string{"error": fmt.Sprint("Agent 编码终止: ", err)})
-			sendAgentFrame(w, sid, 1, failure)
+			failureJSON, _ := json.Marshal(map[string]string{"error": fmt.Sprint("Agent 编码终止: ", err)})
+			sendAgentFrame(w, sid, 1, failureJSON)
 			return fmt.Errorf("编码结束: %v", err)
 		case message := <-input:
 			if message.err != nil {
@@ -114,32 +230,15 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 			case "start":
 				stopSession()
 				session = cmd.Session
-				mouse, err = openMouse()
-				status := "原生鼠标控制可用，可勾选鼠标控制"
-				if err != nil {
-					status = err.Error()
-					mouse = nil
-				}
-				state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil, "message": status})
-				if err := sendAgentFrame(w, session, 1, state); err != nil {
+				if nativeMode {
+					paused = true
+					if err := captureStatus("starting", "正在初始化桌面采集"); err != nil {
+						return err
+					}
+				} else if err := reportMouse(); err != nil {
 					return err
 				}
-				videoCtx, stop := context.WithCancel(ctx)
-				stopEncode = stop
-				done := make(chan error, 1)
-				encoded = done
-				sid := session
-				// 每个新会话都启动新的编码器，第一帧自然产生带参数集的 IDR，不复用旧参考帧。
-				go func() {
-					// 编码结果通过同一 WSS 发送，取消后的旧会话帧不再进入发送队列。
-					err := encode(videoCtx, func(op byte, b []byte) error {
-						if videoCtx.Err() != nil {
-							return videoCtx.Err()
-						}
-						return sendAgentFrame(w, sid, op, b)
-					})
-					done <- err
-				}()
+				launchEncode()
 			case "stop":
 				if cmd.Session != session {
 					return fmt.Errorf("停止指令会话不匹配")
@@ -153,14 +252,34 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 				if err != nil {
 					return err
 				}
+				if nativeMode && paused {
+					continue
+				}
+				if nativeMode && mouse == nil && msg.Action == "heartbeat" {
+					if err := reportMouse(); err != nil {
+						return err
+					}
+				}
 				if mouse == nil {
 					if msg.Action == "heartbeat" || msg.Action == "release" {
+						continue
+					}
+					if nativeMode {
 						continue
 					}
 					return fmt.Errorf("未获准执行鼠标控制")
 				}
 				if err := mouse.handle(msg); err != nil {
-					return err
+					if !nativeMode {
+						return err
+					}
+					mouse.release()
+					mouse = nil
+					log.Printf("鼠标暂停（保留视频/WSS）: %v", err)
+					state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": false, "message": err.Error()})
+					if err := sendAgentFrame(w, session, 1, state); err != nil {
+						return err
+					}
 				}
 			}
 		}

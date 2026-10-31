@@ -1,3 +1,5 @@
+> 当前稳定性版本为 revision 6；请优先阅读 [稳定性修订与一键构建](STABILITY.md)。下方revision 4/5内容仅解释历史实现；revision 6不再在原生进程内复用旧设备重试，改由Go保持WSS、有限完整重建。
+
 # Windows MF 软件编码 Agent：待人工公网验收
 
 已接入用户实测通过的 DXGI + D3D11 + 系统软件 H.264 编码，不使用 FFmpeg。独立探针曾在 Intel HD Graphics 630 / 1920×1080 输出200帧、10个IDR，网页解码与恢复通过；**新的实时 Agent 集成仍待Windows实机、公网视频和鼠标验收**。硬件MFT不参与Agent路径，本次不用继续测硬编。

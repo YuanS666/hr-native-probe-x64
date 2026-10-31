@@ -130,3 +130,42 @@ for(const zoom of [0.8,1,1.25]) {
   }
 }
 console.log(`通过：${pointCases} 组 Windows 九点浏览器逻辑，覆盖 CSS 缩放、DPR、编码与元素留白；未验证真实 GUI。`);
+
+// 采集暂停必须重置解码器，但保留同一WebSocket和会话；恢复后的PTS允许从零重新开始。
+scope.decodedPTS=[];scope.decoderCloses=0;
+vm.runInContext(`
+// VideoDecoder 测试替身仅验证生命周期与时间戳路由，不声称执行了H264解码。
+class TestDecoder {
+ // constructor 为真实页面恢复路径建立独立解码状态。
+ constructor(){this.decodeQueueSize=0;}
+ // configure 保留页面所需方法，本用例只检查生命周期。
+ configure(){}
+ // decode 记录跨恢复前后的PTS，验证新进程PTS零不会与旧解码器混用。
+ decode(chunk){decodedPTS.push(chunk.timestamp);}
+ // close 记录旧解码器是否在采集暂停时被关闭。
+ close(){decoderCloses++;}
+}
+VideoDecoder=TestDecoder;
+// EncodedVideoChunk 保留传入的时间戳和类型，用于检查页面封包路由。
+EncodedVideoChunk=function(value){return value;};
+mouseReady=true;mouseToggle.checked=true;held.add(0);decoder=new TestDecoder();waiting=false;
+const sameWS=ws,sameSession=relaySession;
+message({target:ws,data:JSON.stringify({type:'capture-status',state:'paused',message:'DXGI access lost'})});
+`,scope);
+assert.equal(run('decoderCloses'),1);
+assert.equal(run('decoder===null && waiting && config===null'),true);
+assert.equal(run('mouseToggle.checked && !mouseReady && held.size===0'),true);
+assert.equal(run('ws===sameWS && relaySession===sameSession'),true);
+assert.match(elements['#capture-status'].textContent,/paused/);
+vm.runInContext(`
+message({target:ws,data:JSON.stringify({codec:'avc1.42c028',width:1920,height:1080,fps:20})});
+const recoveredPacket=new ArrayBuffer(18);
+new DataView(recoveredPacket).setUint8(0,1);
+message({target:ws,data:recoveredPacket});
+message({target:ws,data:JSON.stringify({type:'capture-status',state:'running',message:'new IDR'})});
+message({target:ws,data:JSON.stringify({type:'mouse-status',enabled:true,message:'ready'})});
+`,scope);
+assert.deepEqual(run('decodedPTS'),[0]);
+assert.equal(run('!waiting && decoder!==null && mouseReady && mouseToggle.checked'),true);
+assert.equal(run('config.codec'),'avc1.42c028');
+console.log('通过：采集暂停释放拖动并重置解码器；同连接/会话从PTS零恢复，恢复状态不覆盖H264配置（未执行真实解码）。');
