@@ -126,6 +126,7 @@ struct Capture {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGIOutputDuplication> duplication;
+    ComPtr<IDXGIOutput1> output;
     ComPtr<ID3D11Texture2D> bgra;
     ComPtr<ID3D11VideoDevice> videoDevice;
     ComPtr<ID3D11VideoContext> videoContext;
@@ -135,7 +136,7 @@ struct Capture {
     DXGI_ADAPTER_DESC1 adapter{};
     UINT sourceW=0,sourceH=0;
     RECT content{};
-    bool haveFrame=false;
+    bool haveFrame=false,recovered=false;
     UINT64 fresh=0,repeated=0;
 
     // Capture 选择真实主屏对应 adapter，初始化物理尺寸和 GPU 色彩转换，不选择任意独显。
@@ -146,7 +147,6 @@ struct Capture {
         checked(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"CreateDXGIFactory1");
         HMONITOR primary=MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY);
         ComPtr<IDXGIAdapter1> selected;
-        ComPtr<IDXGIOutput1> output;
         DXGI_OUTPUT_DESC desc{};
         for(UINT a=0;!selected;++a) {
             ComPtr<IDXGIAdapter1> candidate;
@@ -182,7 +182,7 @@ struct Capture {
         checked(context.As(&multithread),"ID3D10Multithread");
         multithread->SetMultithreadProtected(TRUE);
         require(multithread->GetMultithreadProtected()!=FALSE,"D3D11 multithread protection unavailable");
-        checked(output->DuplicateOutput(device.Get(),&duplication),"DuplicateOutput");
+        restoreDuplication();
         DXGI_OUTDUPL_DESC du{};duplication->GetDesc(&du);
         sourceW=du.ModeDesc.Width;sourceH=du.ModeDesc.Height;
         require(sourceW>=2&&sourceH>=2&&du.ModeDesc.Format==DXGI_FORMAT_B8G8R8A8_UNORM,"probe requires BGRA8 SDR capture");
@@ -230,14 +230,47 @@ struct Capture {
         std::cerr<<"SDR primary only; cursor composition and HDR are not validated. No audio/input/network.\n";
     }
 
+    // restoreDuplication 在原普通桌面上有限退避重建采集接口，拒绝权限绕过、设备丢失及尺寸变化。
+    void restoreDuplication() {
+        duplication.Reset();haveFrame=false;
+        for(unsigned attempt=0;attempt<10;++attempt) {
+            ordinaryDesktop();
+            checked(device->GetDeviceRemovedReason(),"capture D3D device removed; restart required");
+            HRESULT hr=output->DuplicateOutput(device.Get(),&duplication);
+            if(SUCCEEDED(hr)) {
+                DXGI_OUTDUPL_DESC du{};duplication->GetDesc(&du);
+                DXGI_OUTPUT_DESC desc{};checked(output->GetDesc(&desc),"restored output description");
+                require(desc.AttachedToDesktop && desc.Monitor==MonitorFromPoint(POINT{0,0},MONITOR_DEFAULTTOPRIMARY)
+                    && desc.Rotation==DXGI_MODE_ROTATION_IDENTITY,"primary display changed; restart required");
+                require(du.ModeDesc.Format==DXGI_FORMAT_B8G8R8A8_UNORM
+                    && (!sourceW || (du.ModeDesc.Width==sourceW && du.ModeDesc.Height==sourceH)),
+                    "capture dimensions/format changed; restart required");
+                recovered=true;
+                if(attempt) std::cerr<<"desktop duplication restored; next input requests IDR\n";
+                return;
+            }
+            if(hr!=E_ACCESSDENIED && hr!=DXGI_ERROR_ACCESS_LOST && hr!=DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+                checked(hr,"DuplicateOutput recovery");
+            if(attempt==9) checked(hr,"DuplicateOutput recovery exhausted (10 attempts)");
+            DWORD delay=attempt==0?250:attempt==1?500:attempt==2?1000:2000;
+            std::cerr<<"desktop duplication unavailable; retry "<<(attempt+1)<<"/9 in "<<delay<<" ms\n";
+            Sleep(delay);
+        }
+    }
+
     // next 复制新桌面帧后立即归还 duplication 资源；静止时重复自有纹理，首次没有画面不能伪造黑帧。
     void next() {
         ordinaryDesktop();
         DXGI_OUTDUPL_FRAME_INFO info{};
         ComPtr<IDXGIResource> resource;
         HRESULT hr=duplication->AcquireNextFrame(haveFrame?0:1000,&info,&resource);
+        if(hr==DXGI_ERROR_ACCESS_LOST) {
+            std::cerr<<"desktop duplication access lost; rebuilding on ordinary desktop\n";
+            restoreDuplication();
+            hr=duplication->AcquireNextFrame(1000,&info,&resource);
+        }
         if(hr==DXGI_ERROR_WAIT_TIMEOUT) {require(haveFrame,"no initial desktop frame within 1s");++repeated;return;}
-        checked(hr,"AcquireNextFrame (display change/lock requires restarting probe)");
+        checked(hr,"AcquireNextFrame (recovery failed or desktop unavailable)");
         try {
             if(info.LastPresentTime.QuadPart>0||!haveFrame) {
                 ComPtr<ID3D11Texture2D> texture;
@@ -698,7 +731,7 @@ struct Meter {
 int wmain(int argc,wchar_t** argv) {
     try {
         Options opt=options(argc,argv);
-        std::cerr<<"native-capture revision=4 (MF software Agent streaming)\n";
+        std::cerr<<"native-capture revision=5 (bounded desktop duplication recovery)\n";
         Runtime runtime;
         Capture capture(opt);
         Files files(opt);
@@ -718,8 +751,9 @@ int wmain(int argc,wchar_t** argv) {
             // 正常固定节奏；编码过慢时保留实际时间缺口，不高速补发旧画面。
             LONGLONG pts=submitted==0?0:std::max(lastPTS+duration,LONGLONG((nowMS()-began)*10000/duration)*duration);
             auto sample=capture.sample(opt,texture.Get(),encoder.hardware,pts,duration);
-            bool key=pts>=nextKey;
+            bool key=capture.recovered || pts>=nextKey;
             encoder.submit(sample.Get(),pts,key);
+            capture.recovered=false;
             if(key) nextKey=pts+10000000;
             ++submitted;lastPTS=pts;lastProgress=nowMS();nextTick=std::max(nextTick+1000.0/opt.fps,lastProgress);
         }

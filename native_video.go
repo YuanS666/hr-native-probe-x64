@@ -124,12 +124,12 @@ func forwardNativeVideo(r io.Reader, send func(byte, []byte) error) error {
 		if key {
 			config, _ := json.Marshal(map[string]any{"codec": codec, "width": *width, "height": *height, "fps": *fps})
 			if err := send(1, config); err != nil {
-				return err
+				return fmt.Errorf("发送原生视频配置失败: %w", err)
 			}
 		}
 		binary.BigEndian.PutUint64(packet[9:17], uint64(time.Now().UnixMicro()))
 		if err := send(2, packet); err != nil {
-			return err
+			return fmt.Errorf("发送原生视频帧失败: %w", err)
 		}
 		previous = pts
 		first = false

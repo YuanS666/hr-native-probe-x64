@@ -1,0 +1,17 @@
+[Unit]
+Description=Single-device screen relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=screen-relay
+Group=screen-relay
+WorkingDirectory=/opt/screen-relay
+EnvironmentFile=/etc/screen-relay/relay.env
+ExecStart=/opt/screen-relay/screen-relay -mode relay -listen :8443
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

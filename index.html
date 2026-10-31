@@ -14,6 +14,7 @@
 const canvas=document.querySelector('#screen'), ctx=canvas.getContext('2d');
 const stats=document.querySelector('#stats');
 const mouseToggle=document.querySelector('#mouse'),mouseStatus=document.querySelector('#mouse-status');
+let mouseSuspended=false;
 let mouseReady=false,lastMove=0,held=new Set();
 let relayDevice='',relaySession='';
 let ws,decoder,config,waiting=true, timer,lastError='无';
@@ -130,6 +131,7 @@ document.querySelector('#stop').onclick=stop;
 // sendMouse 通过现有视频连接发送带类型的控制消息，仅移动事件在积压时允许丢弃。
 function sendMouse(msg) {
   if(!ws || ws.readyState!==WebSocket.OPEN) return;
+  if(mouseSuspended && msg.action!=='release' && msg.action!=='heartbeat') return;
   if(!mouseReady && !(relaySession && (msg.action==='heartbeat' || msg.action==='release'))) return;
   if(msg.action==='move' && ws.bufferedAmount>4096) return;
   const mouse={type:'mouse',...msg};
@@ -150,13 +152,13 @@ function mousePoint(event,clamp=false) {
 }
 
 // releaseMouse 在失焦、停止、隐藏和退出控制时通知服务端释放所有按键，并清除本地拖动状态。
-function releaseMouse() {
-  sendMouse({action:'release'});held.clear();mouseToggle.checked=false;
+function releaseMouse(disable=true) {
+  sendMouse({action:'release'});held.clear();if(disable) mouseToggle.checked=false;
 }
 
 // mouseDown 将左右按下立即发送，采用浏览器点击计数生成原生单击或双击，不受移动限频影响。
 function mouseDown(event) {
-  if(!mouseToggle.checked || !mouseReady || !decoder || waiting || event.button>2 || event.button===1) return;
+  if(mouseSuspended || !mouseToggle.checked || !mouseReady || !decoder || waiting || event.button>2 || event.button===1) return;
   const point=mousePoint(event);if(!point) return;
   event.preventDefault();
   const button=event.button===2?1:0;
@@ -166,7 +168,7 @@ function mouseDown(event) {
 
 // mouseMove 将移动限制在每秒至多约 30 次；拖动可越出画面，其位置钳制到视频边界。
 function mouseMove(event) {
-  if(!mouseToggle.checked || !mouseReady || !decoder || waiting) return;
+  if(mouseSuspended || !mouseToggle.checked || !mouseReady || !decoder || waiting) return;
   if(!held.size && event.target!==canvas) return;
   const point=mousePoint(event,held.size>0);if(!point) return;
   const now=performance.now();if(now-lastMove<1000/30) return;lastMove=now;
@@ -184,7 +186,7 @@ function mouseUp(event) {
 
 // mouseWheel 将不同浏览器滚轮单位换算为有限的像素滚动量，仅在视频内控制时阻止页面滚动。
 function mouseWheel(event) {
-  if(!mouseToggle.checked || !mouseReady || !decoder || waiting) return;
+  if(mouseSuspended || !mouseToggle.checked || !mouseReady || !decoder || waiting) return;
   const point=mousePoint(event);if(!point) return;
   event.preventDefault();
   const unit=event.deltaMode===1?16:event.deltaMode===2?canvas.getBoundingClientRect().height:1;
@@ -195,8 +197,14 @@ function mouseWheel(event) {
 // mouseContext 在鼠标控制开启时屏蔽浏览器菜单，让右键由被控桌面处理。
 function mouseContext(event) {if(mouseToggle.checked) event.preventDefault();}
 
-// mouseVisibility 页面进入后台时终止控制，服务端保活超时也会释放断线残留按键。
-function mouseVisibility() {if(document.hidden) releaseMouse();}
+// mouseBlur 在失焦时立即释放拖动并暂停输入，保留用户勾选，返回页面后无需再次开启。
+function mouseBlur() {mouseSuspended=true;releaseMouse(false);if(mouseToggle.checked) mouseStatus.textContent='页面失焦，鼠标已释放；返回页面后恢复控制';}
+
+// mouseFocus 仅在页面可见且真正获得焦点时解除暂停，不恢复已经释放的按键或被用户关闭的开关。
+function mouseFocus() {mouseSuspended=document.hidden || !document.hasFocus();if(!mouseSuspended && mouseToggle.checked) mouseStatus.textContent='鼠标控制已恢复';}
+
+// mouseVisibility 在后台暂停控制，回到前台时仍要求浏览器窗口获得焦点。
+function mouseVisibility() {if(document.hidden) mouseBlur();else mouseFocus();}
 
 // mouseEscape 允许用 Esc 立即停止鼠标控制，保留视频播放。
 function mouseEscape(event) {if(event.key==='Escape') releaseMouse();}
@@ -211,7 +219,8 @@ document.addEventListener('mousemove',mouseMove);
 document.addEventListener('mouseup',mouseUp);
 document.addEventListener('visibilitychange',mouseVisibility);
 document.addEventListener('keydown',mouseEscape);
-window.addEventListener('blur',releaseMouse);
+window.addEventListener('blur',mouseBlur);
+window.addEventListener('focus',mouseFocus);
 window.addEventListener('pagehide',releaseMouse);
 mouseToggle.addEventListener('change',mouseChanged);
 </script>

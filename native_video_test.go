@@ -167,12 +167,15 @@ func TestNativeProcessFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"exit", "bad", "hold"} {
+	for _, mode := range []string{"exit", "bad", "hold", "send-eof", "send-eof-video"} {
 		t.Setenv("SCREEN_NATIVE_TEST_HELPER", mode)
 		ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		failure := errors.New("slow/closed viewer")
-		// send 在hold场景模拟真实WebSocket写失败，其余场景观察子进程自身失败。
-		send := func(byte, []byte) error {
+		// send 分别模拟配置/视频发送EOF和其他写失败，必须与子进程自身退出区分。
+		send := func(op byte, b []byte) error {
+			if mode == "send-eof" || (mode == "send-eof-video" && op == 2) {
+				return io.EOF
+			}
 			if mode == "hold" {
 				return failure
 			}
@@ -182,6 +185,9 @@ func TestNativeProcessFailures(t *testing.T) {
 		stop()
 		if err == nil || errors.Is(err, context.DeadlineExceeded) || (mode == "hold" && !errors.Is(err, failure)) || (mode == "exit" && !strings.Contains(err.Error(), "意外结束")) {
 			t.Fatalf("进程失败处理 mode=%s err=%v", mode, err)
+		}
+		if strings.HasPrefix(mode, "send-eof") && (!errors.Is(err, io.EOF) || strings.Contains(err.Error(), "意外结束")) {
+			t.Fatalf("网络发送EOF被误报为编码进程退出: %v", err)
 		}
 	}
 }
