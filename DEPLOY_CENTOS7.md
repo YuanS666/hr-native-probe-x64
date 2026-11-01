@@ -1,3 +1,5 @@
+> 当前公网已由用户实测跑通。实际二进制为 `/home/wwwroot/erp.beiaiying.com/screen-relay-release/screen-relay`；更新沿用现有服务配置，不重新执行下方首次安装模板。当前行为见[AUDIT_CHANGES.md](AUDIT_CHANGES.md)。
+
 # 当前阿里云 VPS 部署记录
 
 已由用户提供：CentOS Linux 7、x86_64、Go 1.25.5 linux/amd64；Nginx 占用 80/443，现有应用监听 127.0.0.1:8080，MySQL 使用 3306，8443 暂未使用。目标域名为 `erp.beiaiying.com`。
@@ -138,11 +140,5 @@ WantedBy=multi-user.target
 Relay 配置中的 `RELAY_PUBLIC_URL` 必须为 `https://erp.beiaiying.com:8443`，设备 ID 与 Mac Agent 一致，使用两套新生成且不同的认证密钥。TLS 私钥内容和认证密钥都不需要发到聊天中。
 
 当前 Linux 构建产物为 `.cache/screen-relay-linux`，安装包内同样使用 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` 构建，是静态链接的 x86-64 ELF。已通过本机编译、Go 测试、脚本语法检查，以及检查器对正确证书、错误域名、错误私钥的测试。本次尚未实际上传文件、安装服务或改动 VPS 防火墙，真实部署结果待用户执行上述命令反馈。
-
-用户已确认 iPhone 在局域网通过浏览器控制 Mac 正常；公网部署及蜂窝网络验收尚未完成。
-
-用户随后反馈 VPS 的 `screen-relay` 已监听 `[::]:8443`（PID 16064）。Mac Agent 连接域名解析得到的 `175.178.114.113:8443` 超时，说明公网 TCP 可达性尚未确认。下一步核对该 IP 与实例公网 IP、ECS 入方向规则和实际主机防火墙，并使用本机 IPv4 `curl --resolve` 验证服务；`[::]` 显示本身不能证明服务只接受 IPv6。
-
-最新检查：VPS 本机 IPv4 HTTPS 返回 HTTP 200；firewalld 未运行；INPUT 默认 ACCEPT，展示的 `YJ-FIREWALL-INPUT` 规则仅针对 22 端口，但全局 IP 黑名单仍可能拦截。APNIC 将 `175.178.0.0/16` 登记为 TencentCloud，因此原先“阿里云”平台信息需重新核实：可能是实际实例在腾讯云，也可能域名解析没有指向当前 VPS。应先核对真实实例公网 IP，并在对应平台的安全组/轻量服务器防火墙放行 8443，不修改或绕过主机防护链。[APNIC 登记](https://wq.apnic.net/static/search.html?query=175.178.0.0)
 
 CentOS Linux 7 已于 2024-06-30 结束维护；正式长期承载公网远程控制前应安排迁移到受支持的系统。本次不升级现有 VPS，避免影响已有业务。[CentOS 官方说明](https://www.centos.org/centos-linux/)

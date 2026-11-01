@@ -12,6 +12,8 @@ import (
 )
 
 type mouseMessage struct {
+	Code   *string  `json:"code,omitempty"`
+	Repeat *bool    `json:"repeat,omitempty"`
 	Type   string   `json:"type"`
 	Action string   `json:"action"`
 	X      *float64 `json:"x,omitempty"`
@@ -27,16 +29,27 @@ func parseMouse(b []byte) (mouseMessage, error) {
 	if len(b) > 512 || !utf8.Valid(b) {
 		return msg, fmt.Errorf("控制消息过长或不是 UTF-8")
 	}
+	// 鼠标专用wire保持原字段集合，不能因共用业务结构新增Code/Repeat而放过键盘字段（包括null）。
+	var wire struct {
+		Type   string   `json:"type"`
+		Action string   `json:"action"`
+		X      *float64 `json:"x,omitempty"`
+		Y      *float64 `json:"y,omitempty"`
+		Button *int     `json:"button,omitempty"`
+		Clicks *int     `json:"clicks,omitempty"`
+		Delta  *int     `json:"delta,omitempty"`
+	}
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
-	if err := d.Decode(&msg); err != nil {
+	if err := d.Decode(&wire); err != nil {
 		return msg, err
 	}
+	msg = mouseMessage{Type: wire.Type, Action: wire.Action, X: wire.X, Y: wire.Y, Button: wire.Button, Clicks: wire.Clicks, Delta: wire.Delta}
 	var trailing any
 	if d.Decode(&trailing) != io.EOF {
 		return msg, fmt.Errorf("控制消息包含多余数据")
 	}
-	if msg.Type != "mouse" {
+	if msg.Type != "mouse" || msg.Code != nil || msg.Repeat != nil {
 		return msg, fmt.Errorf("未知消息类型")
 	}
 	switch msg.Action {
@@ -86,7 +99,7 @@ func readClientWS(r io.Reader) (byte, []byte, error) {
 }
 
 // readControls 从现有连接接收鼠标 JSON 或协议控制帧；所有退出路径释放会话按键，5 秒无保活则断开控制会话。
-func readControls(c net.Conn, r io.Reader, mouse *nativeMouse) error {
+func readControls(c net.Conn, r io.Reader, mouse mouseController) error {
 	if mouse != nil {
 		defer mouse.release()
 	}
@@ -112,7 +125,7 @@ func readControls(c net.Conn, r io.Reader, mouse *nativeMouse) error {
 		case 10:
 			continue
 		}
-		msg, err := parseMouse(b)
+		msg, err := parseInput(b)
 		if err != nil {
 			return fmt.Errorf("非法控制消息: %w", err)
 		}

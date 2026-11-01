@@ -257,11 +257,12 @@ func (m *observedMouse) handle(msg mouseMessage) error {
 }
 
 // release 只有存在模拟按下状态时才记录释放，验证断开通知真的触发 Agent 清理。
-func (m *observedMouse) release() {
+func (m *observedMouse) release() error {
 	if m.pressed {
 		m.pressed = false
 		m.events <- "release"
 	}
+	return nil
 }
 
 // waitMouse 在有限时间内检查控制指令或释放通知，防止网络清理失败让测试永久阻塞。

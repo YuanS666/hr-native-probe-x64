@@ -22,10 +22,20 @@ static int postMouse(int kind, int button, int clicks, double x, double y, int d
     CFRelease(event);
     return 1;
 }
+// postKey 创建带明确修饰键标志的物理键盘事件，返回值仅代表事件创建及投递调用完成。
+static int postKey(int key, int down, uint64_t flags) {
+    CGEventRef event=CGEventCreateKeyboardEvent(NULL,(CGKeyCode)key,down!=0);
+    if(!event) return 0;
+    CGEventSetFlags(event,(CGEventFlags)flags);
+    CGEventPost(kCGHIDEventTap,event);
+    CFRelease(event);
+    return 1;
+}
 */
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -38,6 +48,7 @@ type nativeMouse struct {
 	x, y    float64
 	pressed [2]bool
 	clicks  [2]int
+	keys    keyboardState
 }
 
 // mousePermissions 只查询系统录屏和辅助功能授权状态，不弹出提示或申请权限。
@@ -83,9 +94,14 @@ func (m *nativeMouse) post(kind C.CGEventType, button, clicks int, x, y float64,
 
 // handle 执行已校验的鼠标指令，记录按键状态用于拖动、双击和异常断开后的释放。
 func (m *nativeMouse) handle(msg mouseMessage) error {
+	if msg.Type == "keyboard" {
+		m.keys.send = m.sendKey
+		if msg.Action == "release" {
+			return m.keys.release()
+		}
+	}
 	if msg.Action == "release" {
-		m.release()
-		return nil
+		return m.releaseMouse()
 	}
 	if msg.Action == "heartbeat" {
 		return nil
@@ -97,6 +113,9 @@ func (m *nativeMouse) handle(msg mouseMessage) error {
 	if C.CGDisplayIsActive(m.display) == 0 || C.CGDisplayBounds(m.display) != m.bounds {
 		m.release()
 		return fmt.Errorf("显示器布局已变化，请重新连接")
+	}
+	if msg.Type == "keyboard" {
+		return m.keys.apply(msg)
 	}
 	m.x, m.y = *msg.X, *msg.Y
 	button := 0
@@ -147,17 +166,53 @@ func (m *nativeMouse) handle(msg mouseMessage) error {
 	return nil
 }
 
-// release 为会话中仍按下的左右键发送释放事件；即使权限被撤回也尽力清理，避免残留拖动状态。
-func (m *nativeMouse) release() {
+// release 归还本会话鼠标和键盘，只有成功才清除状态；权限不可用时返回错误供后台补释放。
+func (m *nativeMouse) release() error { return errors.Join(m.releaseMouse(), m.keys.release()) }
+
+// releaseMouse 只归还鼠标按钮，关闭鼠标开关不会悄悄清空独立键盘状态；失败保留按钮记录。
+func (m *nativeMouse) releaseMouse() error {
+	var first error
 	for button, pressed := range m.pressed {
 		if !pressed {
 			continue
+		}
+		if C.AXIsProcessTrusted() == 0 {
+			return fmt.Errorf("辅助功能权限不可用，保留待释放按键")
 		}
 		kind := C.CGEventType(C.kCGEventLeftMouseUp)
 		if button == 1 {
 			kind = C.kCGEventRightMouseUp
 		}
-		m.post(kind, button, m.clicks[button], m.x, m.y, 0)
-		m.pressed[button] = false
+		if err := m.post(kind, button, m.clicks[button], m.x, m.y, 0); err != nil {
+			if first == nil {
+				first = err
+			}
+		} else {
+			m.pressed[button] = false
+		}
 	}
+	return first
+}
+
+// sendKey 按macOS物理键位投递Quartz事件；权限撤回时保留键盘状态给P0清理任务。
+func (m *nativeMouse) sendKey(code string, down bool, flags uint64) error {
+	if C.AXIsProcessTrusted() == 0 {
+		return fmt.Errorf("辅助功能权限不可用，保留键盘待释放状态")
+	}
+	spec, ok := keyCodes[code]
+	if !ok {
+		return fmt.Errorf("不支持的键盘按键")
+	}
+	// Quartz用NumericPad标志区分数字区；NumLock物理位置在Mac对应Clear，不是Windows式锁定。
+	if strings.HasPrefix(code, "Numpad") || code == "NumLock" {
+		flags |= uint64(C.kCGEventFlagMaskNumericPad)
+	}
+	pressed := 0
+	if down {
+		pressed = 1
+	}
+	if C.postKey(C.int(spec.mac), C.int(pressed), C.uint64_t(flags)) == 0 {
+		return fmt.Errorf("创建键盘事件失败")
+	}
+	return nil
 }

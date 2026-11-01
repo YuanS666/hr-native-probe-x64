@@ -8,7 +8,13 @@ function element(id) {
   if(elements[id]) return elements[id];
   return elements[id]={width:1920,height:1080,checked:false,disabled:false,textContent:'',events:{},
     // addEventListener 记录真实页面绑定的事件处理函数，供测试直接触发。
-    addEventListener(name,handler){this.events[name]=handler;},
+    addEventListener(name,handler){
+      const previous=this.events[name];
+      // dispatch 保留同一事件的全部监听器，与浏览器行为一致，不能覆盖Esc紧急停止。
+      this.events[name]=previous?function(event){previous(event);handler(event);}:handler;
+    },
+    // focus 模拟显式点击画面后的键盘焦点，不触发真实浏览器操作。
+    focus(){document.activeElement=this;},
     // getContext 提供画布初始化所需的最小上下文，本测试不模拟解码显示。
     getContext(){return {};},
     // getBoundingClientRect 返回可调整的 CSS 尺寸，测试缩放和内部留白映射。

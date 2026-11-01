@@ -57,6 +57,12 @@ func encodeMFVideo(ctx context.Context, send func(byte, []byte) error) error {
 		return &nativeCaptureError{cause: fmt.Errorf("需要把配套 screen_capture.exe 与 Agent 放在同一目录: %w", err)}
 	}
 	args := []string{"--stream", "--encoder", "software", "--width", strconv.Itoa(*width), "--height", strconv.Itoa(*height), "--fps", strconv.Itoa(*fps), "--bitrate", strconv.Itoa(*bitrate)}
+	// 在启动DXGI前请求显示器开启，覆盖整个子进程生命周期，所有退出路径均撤销。
+	releaseDisplay, err := captureDisplayRequest()
+	if err != nil {
+		return err
+	}
+	defer releaseDisplay()
 	return runNativeVideo(ctx, helper, args, send)
 }
 
@@ -75,7 +81,15 @@ func runNativeVideo(parent context.Context, helper string, args []string, send f
 		return &nativeCaptureError{cause: fmt.Errorf("启动系统 H264 编码进程: %w", err)}
 	}
 	log.Printf("原生采集启动 PID=%d（同一时刻仅一个子进程）", cmd.Process.Pid)
-	err = forwardNativeVideo(stdout, send)
+	// 子进程卡在系统API内不会退出；取消时主动关闭管道，唤醒ReadFull。
+	watchdog := newVideoWatchdog(ctx, func() { stop(); stdout.Close() })
+	err = forwardNativeVideo(stdout, func(op byte, b []byte) error {
+		if op == 2 {
+			watchdog.frame()
+		}
+		return send(op, b)
+	})
+	stall := watchdog.finish()
 	// 正常EOF先保留子进程退出码；坏包/网络失败立即终止，关闭stdout后卡住也最多等待三秒。
 	if err != io.EOF {
 		stop()
@@ -86,6 +100,9 @@ func runNativeVideo(parent context.Context, helper string, args []string, send f
 	log.Printf("原生采集回收 PID=%d exit=%v pipe=%v", cmd.Process.Pid, waitErr, err)
 	if parent.Err() != nil {
 		return parent.Err()
+	}
+	if stall != nil {
+		return &nativeCaptureError{cause: fmt.Errorf("采集输出超时，进程已回收: %w", stall), retry: true}
 	}
 	if err != io.EOF {
 		return err

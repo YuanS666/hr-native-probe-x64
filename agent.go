@@ -17,15 +17,15 @@ import (
 
 type mouseController interface {
 	handle(mouseMessage) error
-	release()
+	release() error
 }
 
 // openAgentMouse 按现有开关和系统权限创建控制器，不可用时仍允许远程观看视频。
 func openAgentMouse() (mouseController, error) {
-	if !*mouseEnabled {
-		return nil, fmt.Errorf("未启用鼠标；Agent 需要使用 -mouse 启动")
+	if !*mouseEnabled && !*keyboardEnabled {
+		return nil, fmt.Errorf("未启用输入；Agent 使用 -mouse 和/或 -keyboard 显式授权")
 	}
-	m, err := newNativeMouse(*device)
+	m, err := openNativeInput(*device)
 	if err != nil {
 		return nil, err
 	}
@@ -92,12 +92,12 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 	reportMouse := func() error {
 		var err error
 		mouse, err = openMouse()
-		status := "原生鼠标控制可用，可勾选鼠标控制"
+		status := "原生输入权限可用，可按需勾选鼠标/键盘"
 		if err != nil {
 			status = err.Error()
 			mouse = nil
 		}
-		b, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil, "message": status})
+		b, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil && *mouseEnabled, "keyboard": mouse != nil && *keyboardEnabled, "message": status})
 		return sendAgentFrame(w, session, 1, b)
 	}
 	// 上个进程已回收后才启动新编码器；新首帧必须经既有校验确认IDR和参数集。
@@ -248,7 +248,7 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 				if session == "" || cmd.Session != session {
 					return fmt.Errorf("控制指令会话不匹配")
 				}
-				msg, err := parseMouse(cmd.Mouse)
+				msg, err := parseInput(cmd.Mouse)
 				if err != nil {
 					return err
 				}
@@ -276,7 +276,7 @@ func agentConnection(parent context.Context, w *websocket, encode func(context.C
 					mouse.release()
 					mouse = nil
 					log.Printf("鼠标暂停（保留视频/WSS）: %v", err)
-					state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": false, "message": err.Error()})
+					state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": false, "keyboard": false, "message": err.Error()})
 					if err := sendAgentFrame(w, session, 1, state); err != nil {
 						return err
 					}

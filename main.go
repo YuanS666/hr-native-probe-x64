@@ -32,11 +32,13 @@ var fps = flag.Int("fps", 20, "帧率")
 var bitrate = flag.Int("bitrate", 2000000, "目标码率 bit/s")
 var defaultDevice, defaultEncoder = captureDefaults()
 var device = flag.String("device", defaultDevice, "macOS 屏幕名称/编号；Windows 使用 desktop（主显示器）")
+var ffmpegBinary = flag.String("ffmpeg", "ffmpeg", "FFmpeg可执行文件路径；macOS可指定绝对路径，避免后台服务PATH不同")
 var encoder = flag.String("encoder", defaultEncoder, "macOS 默认 h264_videotoolbox；Windows 默认 mf（系统软件H264），libx264需外部FFmpeg")
 var testPattern = flag.Bool("test-pattern", false, "使用测试画面而非真实屏幕")
 var port = flag.Int("port", 8080, "本地端口")
 var active = make(chan struct{}, 1)
 var mouseEnabled = flag.Bool("mouse", false, "启用本机原生鼠标控制；macOS 需要辅助功能授权，Windows 受 UIPI 限制")
+var keyboardEnabled = flag.Bool("keyboard", false, "启用基础物理键盘输入，需原生输入权限；不支持IME文本传输")
 var checkPermissions = flag.Bool("check-permissions", false, "查询当前平台的录屏/输入运行条件后退出")
 var appContext = context.Background()
 var sessions sync.WaitGroup
@@ -71,7 +73,7 @@ func main() {
 	if runtime.GOOS != "darwin" && !(runtime.GOOS == "windows" && runtime.GOARCH == "amd64") {
 		log.Fatal("此平台仅支持 -mode relay；采集和鼠标 Agent 需要 macOS 或 Windows x64")
 	}
-	if *mouseEnabled && *testPattern {
+	if (*mouseEnabled || *keyboardEnabled) && *testPattern {
 		log.Fatal("测试画面不能控制真实桌面，请移除 -test-pattern")
 	}
 	if *width <= 0 || *height <= 0 || *width%2 != 0 || *height%2 != 0 || *fps < 1 || *fps > 120 || *bitrate < 1 {
@@ -86,6 +88,7 @@ func main() {
 	if *encoder == "mf" && runtime.GOOS != "windows" {
 		log.Fatal("mf 编码仅支持 Windows")
 	}
+	log.Printf("Agent修订=5（架构审计修正；Windows熄屏恢复仍待验证）；服务端鼠标=%v 键盘=%v；释放责任跨连接保留", *mouseEnabled, *keyboardEnabled)
 	if *mode == "agent" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -165,18 +168,18 @@ func stream(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(appContext)
 	defer cancel()
-	var mouse *nativeMouse
-	status := "未启用鼠标；使用 -mouse 启动后可启用"
-	if *mouseEnabled {
-		mouse, err = newNativeMouse(*device)
+	var mouse mouseController
+	status := "未启用输入；使用 -mouse 和/或 -keyboard 显式授权"
+	if *mouseEnabled || *keyboardEnabled {
+		mouse, err = openNativeInput(*device)
 		if err != nil {
 			status = err.Error()
-			log.Printf("鼠标控制不可用: %v", err)
+			log.Printf("原生输入不可用: %v", err)
 		} else {
-			status = "原生鼠标控制可用，可勾选鼠标控制"
+			status = "原生输入权限可用，可按需勾选鼠标/键盘"
 		}
 	}
-	state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil, "message": status})
+	state, _ := json.Marshal(map[string]any{"type": "mouse-status", "enabled": mouse != nil && *mouseEnabled, "keyboard": mouse != nil && *keyboardEnabled, "message": status})
 	if writeWS(c, 1, state) != nil {
 		return
 	}
@@ -213,6 +216,7 @@ func encodeVideo(ctx context.Context, send func(byte, []byte) error) error {
 	if *encoder == "mf" {
 		return encodeMFVideo(ctx, send)
 	}
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	args := []string{"-hide_banner", "-loglevel", "warning", "-nostdin"}
@@ -234,8 +238,9 @@ func encodeVideo(ctx context.Context, send func(byte, []byte) error) error {
 		args = append(args, "-preset", "ultrafast", "-tune", "zerolatency")
 	}
 	args = append(args, "-b:v", strconv.Itoa(*bitrate), "-bf", "0", "-g", strconv.Itoa(*fps), "-bsf:v", "h264_metadata=aud=insert", "-flush_packets", "1", "-f", "h264", "pipe:1")
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, *ffmpegBinary, args...)
 	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 3 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -243,6 +248,7 @@ func encodeVideo(ctx context.Context, send func(byte, []byte) error) error {
 	if err = cmd.Start(); err != nil {
 		return err
 	}
+	watchdog := newVideoWatchdog(ctx, func() { cancel(); stdout.Close() })
 	var sps, pps []byte
 	var sequence, frames, bytesSent int64
 	last := time.Now()
@@ -271,6 +277,7 @@ func encodeVideo(ctx context.Context, send func(byte, []byte) error) error {
 			joined = append(joined, prefix...)
 			frame = append(joined, frame[boundary:]...)
 		}
+		watchdog.frame()
 		// 二进制头：key:u8、媒体 PTS:u64、Go 收到完整帧的 Unix 微秒:u64，均为大端。
 		packet := make([]byte, 17+len(frame))
 		if key {
@@ -293,10 +300,20 @@ func encodeVideo(ctx context.Context, send func(byte, []byte) error) error {
 		}
 		return nil
 	})
-	if err != nil {
+	stall := watchdog.finish()
+	if err != nil || stall != nil {
 		cancel()
 	}
+	// stdout关闭后进程仍不退出也必须有界，不能在Wait里永久挂住。
+	grace := time.AfterFunc(3*time.Second, cancel)
 	waitErr := cmd.Wait()
+	grace.Stop()
+	if parent.Err() != nil {
+		return parent.Err()
+	}
+	if stall != nil {
+		return fmt.Errorf("FFmpeg采集输出超时，进程已回收: %w", stall)
+	}
 	if err != nil {
 		return err
 	}

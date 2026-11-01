@@ -112,9 +112,11 @@ func TestNativeProcessHelper(t *testing.T) {
 	if mode == "" {
 		return
 	}
-	if mode == "bad" {
+	if mode == "closed" {
+		os.Stdout.Close()
+	} else if mode == "bad" {
 		os.Stdout.Write([]byte{255, 255, 255, 255})
-	} else {
+	} else if mode != "silent" {
 		os.Stdout.Write(nativeTestRecord(nativeTestPacket(0, true)))
 	}
 	if mode == "recoverable" {

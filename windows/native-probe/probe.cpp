@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include "bitstream.hpp"
+#include "progress.hpp"
 #include "page.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -802,7 +803,7 @@ struct Meter {
 int wmain(int argc,wchar_t** argv) {
     try {
         Options opt=options(argc,argv);
-        std::cerr<<"native-capture revision=6 (diagnosed capture exits; full resource rebuild by Agent)\n";
+        std::cerr<<"native-capture revision=7 (retryable encoder stalls; diagnosed capture exits)\n";
         Runtime runtime;
         Capture capture(opt);
         Files files(opt);
@@ -816,8 +817,7 @@ int wmain(int argc,wchar_t** argv) {
             encoder.pump();
             double time=nowMS();
             if(time-lastStats>=1000) {meter.write(files,capture,submitted,began);lastStats=time;}
-            require(time-lastProgress<5000,"no accepted input/output progress for 5s");
-            if(!encoder.pending.empty()) require(time-encoder.pending.begin()->second<5000,"oldest encoded frame pending for 5s");
+            probe::checkProgress(time,lastProgress,encoder.pending.empty()?-1:encoder.pending.begin()->second);
             if(!encoder.ready()||time<nextTick) {Sleep(1);continue;}
             if(!capture.next()) {lastProgress=nowMS();continue;}
             auto texture=capture.nv12(opt);
@@ -835,6 +835,10 @@ int wmain(int argc,wchar_t** argv) {
         require(files.keys>=2,"no second IDR; recovery cannot be validated");
         meter.write(files,capture,submitted,began);files.finish(opt);
         return 0;
+    } catch(const probe::CaptureStall& e) {
+        diagnostic("encoder progress timeout",HRESULT_FROM_WIN32(WAIT_TIMEOUT));
+        std::cerr<<"CAPTURE_EXIT code=75 reason="<<e.what()<<"; retryable stall, all process resources reclaimed\n";
+        return 75;
     } catch(const NativeFailure& e) {
         std::cerr<<"CAPTURE_EXIT code="<<(e.retry?75:1)<<" reason="<<e.what()<<"; all process resources will be reclaimed\n";
         return e.retry?75:1;

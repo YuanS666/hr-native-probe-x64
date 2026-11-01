@@ -1,16 +1,10 @@
-# 独立 Windows DXGI + Media Foundation H.264 探针
+# 独立 Windows 原生采集编码探针
 
-revision=4新增供Go Agent调用的 `--stream --encoder software` 连续管道模式，不生成文件，且不保存逐帧历史；Agent两文件部署见 [MF_AGENT.md](../MF_AGENT.md)。独立文件探针模式仍保留。Agent默认不使用尚未验证成功的硬件MFT，下一步只需验实时公网链路。
+当前helper修订7。此目录仍支持离线H264/HTML验证，以及生产Agent使用的 `--stream --encoder software` 管道模式。默认生产路径为系统软件MFT；硬件MFT保留作实验，历史Intel Quick Sync输出失败，未标记可用。
 
-状态：用户已确认云端Windows构建成功，Intel HD Graphics 630主屏1920×1080的软件路径输出200帧/10个IDR，软件视频网页验证通过。Intel硬件MFT初始化通过，revision=2首次输出遇到E_UNEXPECTED。revision=3修复异步事件后的重复输出调用，**此修订的Windows硬编运行和网页播放待实机验证**。本程序没有接入 Agent，不连接 Relay，不采集音频、不执行鼠标操作，不修改现有 macOS 或生产浏览器。
+生产部署见[Windows Agent](../MF_AGENT.md)。云构建任务为Build Windows Agent，下载windows-agent-mf-x64；不再使用旧的独立探针Actions产物。以下CMake和离线命令用于独立验证，不代替真实公网验收。
 
-revision=3启动时输出 `native-probe revision=3 (one ProcessOutput per HaveOutput event)`。继承revision=2的WHOLE_SAMPLES兼容修复，仍严格校验实际Annex B、切片帧边界、SPS/PPS、IDR、PTS与输入输出数量。一次HaveOutput只调用一次ProcessOutput，类型变更或仅事件输出后等待下一事件，避免额外读取导致E_UNEXPECTED。新增前3次输出和失败调用的HRESULT、状态、事件计数与pending诊断；这能定位后续错误，不证明硬编已通过。[微软异步MFT契约](https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts)
-
-## 先构建，再复制一个 EXE
-
-**本机没有 VS 或配置较低：优先用 GitHub Actions 云构建。** 源码包内 `.github/workflows/build-native-probe.yml` 使用预装 VS/SDK 的 `windows-2022`。新建一个 GitHub 仓库，将解压后的 `index.html`、`windows/`、`.github/` 上传到仓库根目录并提交，不能只上传 ZIP。Mac Finder 如未显示 `.github`，按 Command+Shift+句号。随后打开 Actions → Build Windows Native Probe，查看自动任务或点击 Run workflow。构建成功后在该次运行底部 Artifacts 下载 `windows-native-probe-x64`，其中包含 EXE、依赖清单、SHA256和构建状态。
-
-此配置本地已准备，**尚未在 GitHub 执行**。云端不运行真实采集，编译或测试失败时不会发布成功产物，应回传失败步骤日志继续修复。下载后在本机直接运行以下软件/硬件测试命令即可。公有仓库标准runner免费，私有仓库取决于账号Actions额度；不需要上传Relay密钥或桌面录像。只上传探针源码包列出的文件即可。
+## 构建
 
 构建机需要 Windows x64、Visual Studio 2022/Build Tools 的“使用 C++ 的桌面开发”、Windows SDK（建议10.0.19041+）和 CMake。VS 安装器可勾选“适用于 Windows 的 C++ CMake 工具”。这些都是**构建依赖**，目标机不需要。
 

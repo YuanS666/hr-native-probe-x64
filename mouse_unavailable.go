@@ -22,4 +22,4 @@ func (m *nativeMouse) handle(msg mouseMessage) error {
 }
 
 // release 为 Relay 编译提供空清理方法；此构建从未按下系统鼠标按钮。
-func (m *nativeMouse) release() {}
+func (m *nativeMouse) release() error { return nil }

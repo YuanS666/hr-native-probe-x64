@@ -1,4 +1,5 @@
 #include "bitstream.hpp"
+#include "progress.hpp"
 #include <iostream>
 #include <fstream>
 #include <iterator>
@@ -7,6 +8,13 @@
 int main(int argc,char** argv) {
     using namespace probe;
     try {
+        checkProgress(4999,0,-1);
+        checkProgress(5000,4999,-1);
+        checkProgress(6000,5999,1001);
+        unsigned stalls=0;
+        try {checkProgress(5000,0,-1);} catch(const CaptureStall&) {++stalls;}
+        try {checkProgress(6000,5999,1000);} catch(const CaptureStall&) {++stalls;}
+        require(stalls==2,"progress timeout classification and exact 5s boundary");
         H264 h;
         h.parameters({0,0,0,1,0x67,0x42,0xc0,0x28,0,0,1,0x68,0xce,0x3c,0x80});
         auto key=h.normalize({0,0,1,0x65,0xb8,0x80});

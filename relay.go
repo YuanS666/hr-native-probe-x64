@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -36,6 +37,7 @@ type relayServer struct {
 	mu                                  sync.Mutex
 	agent, viewer                       *websocket
 	session                             string
+	logins                              loginLimiter
 }
 
 const loginPage = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>远程屏幕认证</title><h1>连接 Mac</h1><form method="post" action="/login"><p><label>设备 ID <input name="device" required maxlength="64" autocomplete="username"></label></p><p><label>浏览器密钥 <input type="password" name="key" required autocomplete="current-password"></label></p><button>认证</button></form><p>输入 Relay 配置的设备 ID 和浏览器密钥。密钥不会放入 URL 或前端源码。</p></html>`
@@ -86,7 +88,7 @@ func decodeRelayCommand(b []byte) (relayCommand, error) {
 		return cmd, fmt.Errorf("设备或会话格式无效")
 	}
 	if cmd.Type == "control" {
-		if _, err := parseMouse(cmd.Mouse); err != nil {
+		if _, err := parseInput(cmd.Mouse); err != nil {
 			return cmd, err
 		}
 	} else if (cmd.Type != "start" && cmd.Type != "stop") || len(cmd.Mouse) != 0 {
@@ -133,8 +135,32 @@ func (s *relayServer) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "来源无效", 403)
 		return
 	}
+	// 只信任真实TCP对端，不接受可伪造的X-Forwarded-For/Forwarded；IPv4映射地址统一，IPv6按/64归组。
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "来源地址无效", 400)
+		return
+	}
+	address := peer.Addr().Unmap().WithZone("")
+	source := address.String()
+	if address.Is6() {
+		source = netip.PrefixFrom(address, 64).Masked().String()
+	}
+	if wait := s.logins.blocked(source, time.Now()); wait > 0 {
+		loginRetry(w, wait)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	if r.ParseForm() != nil || r.PostForm.Get("device") != s.device || !sameSecret(r.PostForm.Get("key"), s.viewerKey) {
+	parsed := r.ParseForm() == nil
+	// 表单读取不持有限频锁，避免慢请求阻塞其他来源；比较及失败计数在锁内原子完成。
+	authenticated, wait := s.logins.verify(source, time.Now(), func() bool {
+		return parsed && r.PostForm.Get("device") == s.device && sameSecret(r.PostForm.Get("key"), s.viewerKey)
+	})
+	if wait > 0 {
+		loginRetry(w, wait)
+		return
+	}
+	if !authenticated {
 		http.Error(w, "设备或密钥错误", 401)
 		return
 	}
@@ -165,6 +191,16 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/login":
 		s.login(w, r)
+	case "/session":
+		if r.Method != "GET" {
+			http.Error(w, "仅支持GET", 405)
+			return
+		}
+		if _, ok := s.viewerExpiry(r); !ok {
+			http.Error(w, "授权已过期", 401)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "/agent":
 		if r.Header.Get("Origin") != "" || r.Header.Get("X-Device-ID") != s.device || !sameSecret(r.Header.Get("Authorization"), "Bearer "+s.agentKey) {
 			http.Error(w, "Agent 认证失败", 401)
@@ -172,7 +208,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.serveAgent(w, r)
 	case "/ws":
-		expires, ok := s.viewerExpiry(r)
+		_, ok := s.viewerExpiry(r)
 		if !ok {
 			http.Error(w, "请刷新页面重新认证", 401)
 			return
@@ -181,7 +217,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "来源无效", 403)
 			return
 		}
-		s.serveViewer(w, r, expires)
+		s.serveViewer(w, r)
 	case "/":
 		if r.Method != "GET" {
 			http.Error(w, "仅支持 GET", 405)
@@ -231,6 +267,8 @@ func (s *relayServer) serveAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	log.Print("Relay: Agent 已认证连接")
+	var forwardStats videoForwardStats
+	var forwardSession string
 	for {
 		op, b, err := a.read()
 		if err != nil {
@@ -253,7 +291,17 @@ func (s *relayServer) serveAgent(w http.ResponseWriter, r *http.Request) {
 		if viewer == nil || session != current {
 			continue
 		}
-		if viewer.write(kind, payload) != nil {
+		if forwardSession != session {
+			forwardStats = videoForwardStats{}
+			forwardSession = session
+		}
+		started := time.Now()
+		writeErr := viewer.write(kind, payload)
+		if kind == 2 {
+			forwardStats.record(started, len(payload)-17, writeErr)
+		}
+		if writeErr != nil {
+			log.Printf("Relay: 浏览器视频/状态转发失败，终止旧参考帧链: %v", writeErr)
 			s.detachViewer(viewer)
 		}
 	}
@@ -269,7 +317,7 @@ func (s *relayServer) sendCommand(kind, session string, mouse json.RawMessage) e
 }
 
 // serveViewer 只接纳一个有设备授权的浏览器，每次连接生成新会话并要求 Agent 从新编码器的 IDR 开始。
-func (s *relayServer) serveViewer(w http.ResponseWriter, r *http.Request, expires time.Time) {
+func (s *relayServer) serveViewer(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	if s.agent == nil || s.viewer != nil {
 		s.mu.Unlock()
@@ -300,7 +348,8 @@ func (s *relayServer) serveViewer(w http.ResponseWriter, r *http.Request, expire
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithDeadline(r.Context(), expires)
+	// Cookie的30分钟限制用于建立新连接；已认证连接由下方5秒应用保活及显式停止管理，不在观看中硬切断。
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	go v.keepAlive(ctx)
 	// 应用层保活消失时也释放控制，不能仅依赖浏览器自动回复的协议 pong。
@@ -417,6 +466,7 @@ func runRelay(ctx context.Context) error {
 	done := make(chan struct{})
 	// 取消时先关闭升级连接，再等待普通 HTTP 请求结束，避免退出留下控制会话。
 	go func() { <-ctx.Done(); s.closeConnections(); server.Close(); close(done) }()
+	log.Printf("Relay: 登录失败限频已启用：来源%d次/分钟、全局%d次/分钟，最多%d来源记录", loginSourceFailures, loginGlobalFailures, loginSourceCapacity)
 	log.Printf("Relay: %s，监听 %s，单设备 %s", s.origin, *relayListen, s.device)
 	err = server.ServeTLS(&cappedListener{Listener: l, slots: make(chan struct{}, 16)}, "", "")
 	if ctx.Err() != nil {

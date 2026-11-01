@@ -1,14 +1,14 @@
-# macOS H.264 屏幕验证
+# H.264 远程桌面
 
-Go 标准库 + FFmpeg + 原生 WebCodecs；无 Go 第三方依赖。鼠标控制通过 cgo 调用 macOS 自带的 ApplicationServices/CoreGraphics，需要启用 cgo（macOS 默认启用）和 Xcode Command Line Tools。仅监听 `127.0.0.1`，单观看者，点击开始才采集，停止后结束 FFmpeg。默认不开启鼠标。
+Windows/macOS Go Agent主动连接Go Relay，浏览器使用WebCodecs解码并进行原生键鼠控制。默认1920×1080、20 FPS、2 Mbps；无第三方Go依赖。
 
-默认本地模式保持不变。新增主动连接的 Agent 和 HTTPS/WSS 公网 Relay，配置、双进程测试及 VPS 部署见 [RELAY.md](RELAY.md)。
+- macOS：FFmpeg AVFoundation + VideoToolbox；以下为本地运行及授权说明。
+- Windows：DXGI + D3D11 + 系统软件Media Foundation H.264，目标机无需FFmpeg；见[Windows部署](windows/MF_AGENT.md)。
+- 公网：[Relay配置](RELAY.md)、[现有VPS部署](DEPLOY_CENTOS7.md)。
+- 输入：[键鼠及重连](INPUT_UPDATE.md)；诊断：[性能测量](PERFORMANCE_V1.md)。
+- 当前修订与验证边界：[审计处理结果](AUDIT_CHANGES.md)。Go Agent修订5、原生helper修订7；Windows熄屏恢复仍未解决，不能将编译通过当作修复通过。
 
-Windows 10/11 x64 Agent 的实现、构建证据与实机验收步骤见 [WINDOWS.md](WINDOWS.md)。当前 Windows 状态为**待人工端到端验收**；原有 macOS 经公网 Relay 的手机浏览器控制已由用户确认。
-
-Windows 现已接入系统软件 MF H.264，默认无需安装 FFmpeg；两文件部署与本次公网验收步骤见 [windows/MF_AGENT.md](windows/MF_AGENT.md)。独立软件编码与网页解码已由用户验证，新的Agent实时集成仍待实测。
-
-## 运行
+## macOS本地运行
 
 安装 Go、FFmpeg 和 Chrome。先在普通 macOS 终端检查设备：
 
@@ -58,7 +58,7 @@ go run . -encoder libx264
 - 每个 IDR 前发送 JSON codec 配置。从 SPS 读取 profile/compatibility/level 形成 `avc1.xxxxxx`。关键帧内带缓存的 SPS/PPS，AUD 保持首位。
 - 二进制消息：1 字节 IDR 标志、8 字节大端媒体 PTS（微秒）、8 字节大端 Go 收到完整编码帧时的 Unix 微秒，之后为整帧 Annex B。媒体 PTS 为帧号乘帧周期，从零开始，**不是原始屏幕捕获时间**。
 - 浏览器不配置 `description`，以 Annex B 模式解码。解码异常或积压时清空解码器并等待下一个 IDR；重新点击开始可重连。
-- 终端显示发送 FPS、H.264 实际负载码率和 FFmpeg 错误；页面显示接收/绘制 FPS、实际负载码率、错误数、丢弃数、解码队列、解码排队耗时及延迟的每秒均值/最大值。静止桌面实际码率低于目标是正常的，2 Mbps 是编码目标，并非固定网络流量。
+- 终端显示发送 FPS、H.264 实际负载码率和 FFmpeg 错误；页面显示接收/绘制 FPS、实际负载码率、错误数、丢弃数、解码队列、解码排队耗时及延迟的每秒P50/P95/最大值。静止桌面实际码率低于目标是正常的，2 Mbps 是编码目标，并非固定网络流量。
 - “编码帧就绪 → canvas”只估计 Go 收到完整帧后到浏览器绘制提交的时间，包含传输、排队、解码，依赖同机时钟稳定。它不含屏幕采集、编码、真实屏幕呈现；AUD 边界检测也引入约一帧等待。无法可靠报告端到端延迟、单帧编码耗时或显示器实际刷新 FPS。解码耗时包含排队，不等于纯硬件解码时间。
 - WebSocket 视频仍使用原有二进制格式，配置使用 JSON；新增上行鼠标 JSON（`type: "mouse"`）和下行鼠标状态（`type: "mouse-status"`）。支持客户端 ping/pong/close。读写并发时按完整帧串行写入，慢客户端写入超时后断开。
 
@@ -114,26 +114,6 @@ sendMouse({action:'up',x:0.5,y:0.5,button:0});
 
 ## 验证状态
 
-```sh
-go test -v ./...
-go build .
-node mouse_test.cjs
-```
-
-当前开发环境已验证 Go 编译、Annex B 分帧单测、libx264 1080p/20 FPS 两秒 40 帧编码，以及进程内 WebSocket 输出协议测试。测试图与软件编码仅用于诊断。
-
-2026-10-30，用户反馈本机实测功能正常，屏幕视频链路已获用户实测确认。未另行记录实测启动参数及性能数据，不据此宣称硬件编码或某一性能指标已单独验证。
-
-开发沙箱内仍无法绑定本地端口，AVFoundation 未列出屏幕，VideoToolbox 返回 -12908，浏览器自动化也未能稳定启动。这些是开发环境中的限制记录；本机实测结果以上述用户反馈为准。
-
-2026-10-31 复查：Go 1.25.2、FFmpeg 9.0.2；编译、`go vet`、`go test -race`、视频测试、鼠标输入校验/掩码协议测试及进程内真实握手/视频与 pong 并发测试通过。Node 测试覆盖坐标、CSS 缩放、内部留白、DPR、移动限频、点击/释放不被限频丢弃、双击计数、右键、滚轮与失焦清理。这些测试没有注入原生鼠标事件，也没有运行浏览器解码。
-
-本次开发环境检查仍得到端口绑定 `operation not permitted`、屏幕设备列表为空、硬件编码会话 -12908；开发进程的录屏/辅助功能查询均为 false。没有重复尝试受限操作或扩大权限。这些结果仅代表开发沙箱，不代表用户本机进程的授权状态。
-
-2026-10-31，用户反馈本机已能移动鼠标，**鼠标移动已获用户实测确认**。用户仅有本机测试环境；“点击应该没问题”属于推测，因此左键、右键、双击、拖动、滚动及失焦/断线释放仍标记为待实测。当前版本视频播放未单独记录新的验收数据，保留此前视频版本的实测结论。
+用户已确认Mac/Windows公网视频、鼠标及Windows基础键盘可用；旧Windows修订曾连续20分钟无断开。最新代码的自动测试、待验收项及熄屏限制见[AUDIT_CHANGES.md](AUDIT_CHANGES.md)，性能历史数据与测量边界见[PERFORMANCE_V1.md](PERFORMANCE_V1.md)。没有用编译成功替代真实屏幕或端到端验证。
 
 参考：https://etducky.com/blog/webcodecs-h264-remote-desktop
-
-原生 API 与屏幕枚举参考：[Apple CGEvent 字段](https://developer.apple.com/documentation/coregraphics/cgeventfield)、[FFmpeg AVFoundation 实现](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/avfoundation.m)。
-
-新增 Relay 前，用户进一步明确确认本地视频链路、鼠标移动/点击及 macOS 原生鼠标执行正常。公网 Relay 的验证状态和待验收项目单独记录于 [RELAY.md](RELAY.md)。

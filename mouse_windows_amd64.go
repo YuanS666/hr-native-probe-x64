@@ -3,8 +3,8 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -164,6 +164,7 @@ type nativeMouse struct {
 	display windowsDisplay
 	layout  windowsVideoLayout
 	state   windowsMouseState
+	keys    keyboardState
 }
 
 // newNativeMouse 为主显示器创建输入映射，复用已有鼠标协议且不注入任何初始化事件。
@@ -185,11 +186,16 @@ func newNativeMouse(device string) (*nativeMouse, error) {
 	return &nativeMouse{display: d, layout: l, state: windowsMouseState{send: sendWindowsInputs}}, nil
 }
 
-// handle 将已校验的归一化指令转换为原生事件，布局变化或 API 失败即终止会话并尝试清理按键。
+// handle 执行已校验的鼠标或键盘事件，布局变化或API失败时返回错误并保留清理责任。
 func (m *nativeMouse) handle(msg mouseMessage) error {
+	if msg.Type == "keyboard" {
+		m.keys.send = m.sendKey
+		if msg.Action == "release" {
+			return m.keys.release()
+		}
+	}
 	if msg.Action == "release" {
-		m.release()
-		return nil
+		return m.releaseMouse()
 	}
 	if err := windowsDesktopReady(); err != nil {
 		return err
@@ -204,6 +210,9 @@ func (m *nativeMouse) handle(msg mouseMessage) error {
 	if msg.Action == "heartbeat" {
 		return nil
 	}
+	if msg.Type == "keyboard" {
+		return m.keys.apply(msg)
+	}
 	clamp := msg.Action == "move" && (m.state.pressed[0] || m.state.pressed[1])
 	position, inside := m.layout.point(*msg.X, *msg.Y, clamp)
 	var point *windowsInput
@@ -217,16 +226,39 @@ func (m *nativeMouse) handle(msg mouseMessage) error {
 	return nil
 }
 
-// release 在普通桌面释放本会话按键，系统锁屏或 API 拒绝时明确记录失败，不向安全桌面投递输入。
-func (m *nativeMouse) release() {
+// release 仅在普通桌面释放本会话鼠标与键盘，失败返回错误并保留状态，不向安全桌面投递。
+func (m *nativeMouse) release() error {
+	return errors.Join(m.releaseMouse(), m.keys.release())
+}
+
+// releaseMouse 只归还鼠标按钮，不取消独立键盘开关正在持有的修饰键；失败保留按钮责任。
+func (m *nativeMouse) releaseMouse() error {
 	if !m.state.pressed[0] && !m.state.pressed[1] {
-		return
+		return nil
 	}
 	if err := windowsDesktopReady(); err != nil {
-		log.Printf("Windows 按键释放未完成：%v", err)
-		return
+		return err
 	}
-	if err := m.state.release(); err != nil {
-		log.Printf("Windows 按键释放失败：%v", err)
-	}
+	return m.state.release()
 }
+
+// sendKey 仅在普通控制台桌面注入一个40字节键盘INPUT，检查实际数量且不绕过UIPI。
+func (m *nativeMouse) sendKey(code string, down bool, _ uint64) error {
+	if err := windowsDesktopReady(); err != nil {
+		return err
+	}
+	event, err := windowsKeyEvent(code, down)
+	if err != nil {
+		return err
+	}
+	n, _, last := winSend.Call(1, uintptr(unsafe.Pointer(&event)), unsafe.Sizeof(event))
+	runtime.KeepAlive(&event)
+	if n != 1 {
+		return fmt.Errorf("键盘SendInput 插入 %d/1，Windows error=%v；可能受UIPI限制", n, last)
+	}
+	return nil
+}
+
+// 键盘INPUT和鼠标INPUT必须使用相同的40字节ABI尺寸。
+var _ [40 - unsafe.Sizeof(windowsKeyboardInput{})]byte
+var _ [unsafe.Sizeof(windowsKeyboardInput{}) - 40]byte
