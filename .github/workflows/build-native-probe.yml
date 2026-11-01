@@ -8,8 +8,12 @@ on:
       - 'windows/**'
       - 'index.html'
       - 'mouse_test.cjs'
+      - 'input_browser_test.cjs'
       - '*.go'
       - 'go.mod'
+      - 'INPUT_UPDATE.md'
+      - 'LOGIN_LIMIT.md'
+      - 'AUDIT_CHANGES.md'
 
 permissions:
   contents: read
@@ -27,7 +31,14 @@ jobs:
           go-version: '1.25.x'
           cache: false
       - name: Test browser pause/resume and mouse handling
-        run: node mouse_test.cjs
+        run: |
+          node mouse_test.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Mouse browser tests failed" }
+          node input_browser_test.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Input/reconnect browser tests failed" }
+      - name: Compile display diagnostics without running them
+        shell: powershell
+        run: ./windows/check-display-diagnostics.ps1
       - name: One-command native and Agent build
         shell: pwsh
         run: ./windows/build.ps1
@@ -43,3 +54,26 @@ jobs:
           path: release/linux-relay-amd64/
           if-no-files-found: error
           retention-days: 7
+
+  mac-regression:
+    name: Mac build and lifecycle tests (no desktop)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Test native protocol, input cleanup and hung video processes
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 -run '^(TestNative|TestAgent|TestInputCleanup|TestKeyboard|TestRelayLoginLimit|TestRelayAuthorization|TestLoginOriginPolicy|TestWSSRequired|TestRelaySession|TestRelaySlowViewer|TestRelayHalfOpenAgent|TestRelayActiveAuthorization|FuzzReadWSFrame|TestFFmpegWatchdog)' .
+      - name: Fuzz bounded WebSocket frame parser
+        run: go test -run '^$' -fuzz '^FuzzReadWSFrame$' -fuzztime 5s -parallel 1 -timeout 30s .
+      - name: Compile Mac Agent (no recording or input injection)
+        env:
+          CGO_ENABLED: '1'
+        run: go build -o .cache/screen-agent-macos .
