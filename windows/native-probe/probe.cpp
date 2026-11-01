@@ -523,7 +523,7 @@ struct Encoder {
 
     // property 设置并记录实际编码属性，关键属性拒绝时让候选失败而不是静默继续。
     void property(const GUID& key,ULONG value,const char* name,bool mandatory=true,bool boolean=false) {
-        VARIANT v;VariantInit(&v);v.vt=boolean?VT_BOOL:VT_UI4;
+        VARIANT v;VariantInit(&v);v.vt=static_cast<VARTYPE>(boolean?VT_BOOL:VT_UI4);
         if(boolean) v.boolVal=value?VARIANT_TRUE:VARIANT_FALSE;else v.ulVal=value;
         HRESULT hr=codec->SetValue(&key,&v);
         std::cerr<<name<<"="<<value<<" HRESULT=0x"<<std::hex<<static_cast<unsigned long>(hr)<<std::dec<<'\n';

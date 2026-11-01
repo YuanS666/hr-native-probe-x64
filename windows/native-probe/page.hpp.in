@@ -1,3 +1,10 @@
 #pragma once
-inline const char* probePage = R"PROBE_HTML(@PROBE_HTML@)PROBE_HTML";
-inline const char* probeScript = R"PROBE_JS(@PROBE_JS@)PROBE_JS";
+// 字节数组逐字节保留HTML和JavaScript，末尾补NUL，不使用超长字符串字面量。
+inline const unsigned char probePageData[] = {
+@PROBE_HTML_BYTES@
+0};
+inline const unsigned char probeScriptData[] = {
+@PROBE_JS_BYTES@
+0};
+inline const char* const probePage = reinterpret_cast<const char*>(probePageData);
+inline const char* const probeScript = reinterpret_cast<const char*>(probeScriptData);
